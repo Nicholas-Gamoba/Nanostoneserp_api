@@ -60,11 +60,7 @@ async def run_serp_and_notify(
 
     except Exception as e:
         logger.error(f"Background SERP task failed for job_id {job_id}: {e}")
-        await webhook_service.send_webhook(
-            result_data={"status": "failed", "job_id": job_id, "error": str(e)},
-            origin_url=callback_url,
-            webhook_path="/api/webhook/serp-completed",
-        )
+        # Don't send webhook on failure — the route expects items and will reject it
 
 
 @router.post("/serp/search")
