@@ -13,8 +13,8 @@ API_BASE_URL = "https://api.dataforseo.com/v3/serp/google/organic"
 
 class SerpService:
     def __init__(self):
-        self.username = settings.DFS_USERNAME
-        self.password = settings.DFS_PASSWORD
+        self.username = settings.DFS_USERNAME or ""
+        self.password = settings.DFS_PASSWORD or ""
         self.auth = (self.username, self.password)
         self.headers = {"Content-Type": "application/json"}
         logger.info("SerpService initialized")
@@ -30,7 +30,10 @@ class SerpService:
         language: str,
         depth: int = 100,
     ) -> list:
-        """Full flow: create task → wait for ready → fetch results → parse items"""
+        """Full flow: clear backlog → create task → wait for ready → fetch results → parse items"""
+
+        # 0. Clear any old ready tasks to keep the queue clean
+        await self._clear_ready_backlog()
 
         # 1. Build payload
         payload = [
@@ -72,6 +75,26 @@ class SerpService:
     # PRIVATE — API calls
     # ------------------------------------------------------------------
 
+    async def _clear_ready_backlog(self):
+        """Fetch and discard any old ready tasks to keep the queue clean"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    "https://api.dataforseo.com/v3/serp/tasks_ready",
+                    auth=self.auth,
+                    headers=self.headers,
+                    timeout=30.0,
+                )
+            if response.status_code == 200:
+                tasks = response.json().get("tasks", [])
+                for task in tasks:
+                    for result in task.get("result", []):
+                        old_id = result.get("id")
+                        await self._get_task_result(old_id)
+                        logger.info(f"Cleared old ready task: {old_id}")
+        except Exception as e:
+            logger.warning(f"Error clearing backlog: {e}")
+
     async def _create_task(self, payload: list) -> Optional[list]:
         """POST task to DataForSEO and return list of (task_id, cost) tuples"""
         try:
@@ -109,6 +132,7 @@ class SerpService:
         max_retries: int = 20,
         poll_interval: int = 15,
     ) -> Optional[str]:
+        """Poll tasks_ready until our task_id appears, return permanent id"""
         logger.info(f"Waiting for task {task_id} to be ready...")
         await asyncio.sleep(10)
 
@@ -123,41 +147,37 @@ class SerpService:
                     )
 
                 if response.status_code == 200:
-                    result_json = response.json()
-                    tasks = result_json.get("tasks", [])
-                    
-                    # Log the full raw response
-                    logger.info(f"tasks_ready raw: {response.text}")
-                    logger.info(f"Number of tasks in response: {len(tasks)}")
-                    
-                    for task in tasks:
-                        logger.info(f"Task status: {task.get('status_code')}, results: {task.get('result')}")
-                        if task.get("status_code") == 20000 and task.get("result"):
-                            for result in task["result"]:
-                                logger.info(f"Available result id: {result.get('id')} vs looking for: {task_id}")
+                    tasks = response.json().get("tasks", [])
 
                     for task in tasks:
                         if task.get("status_code") == 20000 and task.get("result"):
                             for result in task["result"]:
-                                if result.get("id") == task_id:
+                                result_id = result.get("id")
+                                if result_id == task_id:
                                     logger.info(f"Task {task_id} is ready")
-                                    return result["id"]
+                                    return result_id
 
                         elif task.get("status_code", 0) >= 40000:
                             logger.error(f"Task failed: {task.get('status_message')}")
                             return None
 
-                    logger.info(f"Task {task_id} not ready yet (attempt {attempt + 1}/{max_retries})")
+                    logger.info(
+                        f"Task {task_id} not ready yet (attempt {attempt + 1}/{max_retries})"
+                    )
 
                 else:
-                    logger.warning(f"tasks_ready poll failed — {response.status_code}: {response.text}")
+                    logger.warning(
+                        f"tasks_ready poll failed — {response.status_code}: {response.text}"
+                    )
 
             except Exception as e:
                 logger.error(f"Error polling tasks_ready: {e}")
 
             await asyncio.sleep(poll_interval)
 
-        logger.error(f"Task {task_id} did not become ready after {max_retries} attempts")
+        logger.error(
+            f"Task {task_id} did not become ready after {max_retries} attempts"
+        )
         return None
 
     async def _get_task_result(self, task_id: str) -> Optional[dict]:
@@ -208,7 +228,6 @@ class SerpService:
                                 "title": item.get("title"),
                                 "description": item.get("description"),
                                 "images": item.get("images"),
-                                # Full raw item stored in data for completeness
                                 "data": item,
                             }
                         )
