@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class WebhookService:
     def __init__(self):
         self.default_webhook_url = settings.VERCEL_WEBHOOK_URL
-        self.webhook_secret = settings.WEBHOOK_SECRET
+        self.webhook_secret = settings.WEBHOOK_SECRET.strip() if settings.WEBHOOK_SECRET else None
         logger.info("WebhookService initialized")
 
     async def send_webhook(

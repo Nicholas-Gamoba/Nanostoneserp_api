@@ -109,10 +109,7 @@ class SerpService:
         max_retries: int = 20,
         poll_interval: int = 15,
     ) -> Optional[str]:
-        """Poll tasks_ready until our task_id appears, return permanent id"""
         logger.info(f"Waiting for task {task_id} to be ready...")
-
-        # Give DataForSEO a moment before first poll
         await asyncio.sleep(10)
 
         for attempt in range(max_retries):
@@ -126,7 +123,9 @@ class SerpService:
                     )
 
                 if response.status_code == 200:
-                    tasks = response.json().get("tasks", [])
+                    result_json = response.json()
+                    logger.info(f"tasks_ready response: {json.dumps(result_json, indent=2)}")  # ← added
+                    tasks = result_json.get("tasks", [])
 
                     for task in tasks:
                         if task.get("status_code") == 20000 and task.get("result"):
@@ -139,24 +138,17 @@ class SerpService:
                             logger.error(f"Task failed: {task.get('status_message')}")
                             return None
 
-                    logger.info(
-                        f"Task {task_id} not ready yet "
-                        f"(attempt {attempt + 1}/{max_retries})"
-                    )
+                    logger.info(f"Task {task_id} not ready yet (attempt {attempt + 1}/{max_retries})")
 
                 else:
-                    logger.warning(
-                        f"tasks_ready poll failed — {response.status_code}: {response.text}"
-                    )
+                    logger.warning(f"tasks_ready poll failed — {response.status_code}: {response.text}")
 
             except Exception as e:
                 logger.error(f"Error polling tasks_ready: {e}")
 
             await asyncio.sleep(poll_interval)
 
-        logger.error(
-            f"Task {task_id} did not become ready after {max_retries} attempts"
-        )
+        logger.error(f"Task {task_id} did not become ready after {max_retries} attempts")
         return None
 
     async def _get_task_result(self, task_id: str) -> Optional[dict]:
