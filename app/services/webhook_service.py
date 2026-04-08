@@ -104,7 +104,7 @@ class WebhookService:
     def _construct_webhook_url(
         self,
         origin_url: Optional[str],
-        webhook_path: str = "/api/webhook/serp-completed",
+        webhook_path: str = "/api/webhooks/serp-completed",
     ) -> Optional[str]:
         """Construct the webhook URL from the origin URL.
 
