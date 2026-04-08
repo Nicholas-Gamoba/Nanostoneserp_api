@@ -26,8 +26,6 @@ class SerpService:
     async def fetch_serp_results(
         self,
         keyword: str,
-        country: str,
-        language: str,
         depth: int = 100,
     ) -> list:
         """Full flow: clear backlog → create task → wait for ready → fetch results → parse items"""
@@ -180,7 +178,6 @@ class SerpService:
         return None
 
     async def _get_task_result(self, task_id: str) -> Optional[dict]:
-        """Fetch the full result for a ready task"""
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
@@ -194,13 +191,17 @@ class SerpService:
                 logger.info(f"Fetched results for task {task_id}")
                 return response.json()
             else:
-                logger.error(
-                    f"Result fetch failed — {response.status_code}: {response.text}"
-                )
+                logger.error(f"Result fetch failed — {response.status_code}: {response.text}")
                 return None
 
+        except httpx.TimeoutException as e:
+            logger.error(f"Timeout fetching task result: {e}")
+            return None
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error fetching task result: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Error fetching task result: {e}")
+            logger.error(f"Unexpected error fetching task result: {e}", exc_info=True)
             return None
 
     # ------------------------------------------------------------------
