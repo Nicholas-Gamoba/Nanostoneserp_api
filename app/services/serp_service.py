@@ -39,10 +39,9 @@ class SerpService:
         payload = [
             {
                 "keyword": keyword,
-                "location_name": country,
-                "language_name": language,
+                "location_code": 2208,
+                "language_code": "da",
                 "depth": depth,
-                "se_type": "organic",
             }
         ]
 
