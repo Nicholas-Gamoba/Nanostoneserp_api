@@ -36,7 +36,7 @@ def read_root():
             "POST /api/serp/search    — trigger a DataForSEO SERP search",
             "POST /api/serp/webhook   — receive DataForSEO results callback",
             "GET  /api/serp/{job_id}  — poll job status",
-        ],
+        ], 
     }
 
 
