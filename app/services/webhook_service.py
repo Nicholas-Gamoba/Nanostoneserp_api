@@ -21,7 +21,7 @@ class WebhookService:
         self,
         result_data: Dict[str, Any],
         origin_url: Optional[str] = None,
-        webhook_path: str = "/api/webhook/serp-completed",
+        webhook_path: str = "/api/webhooks/serp-completed",
     ) -> bool:
         """Send SERP results back to the Vercel app.
 
