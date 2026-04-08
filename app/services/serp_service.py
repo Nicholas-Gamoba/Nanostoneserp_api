@@ -124,8 +124,17 @@ class SerpService:
 
                 if response.status_code == 200:
                     result_json = response.json()
-                    logger.info(f"tasks_ready response: {json.dumps(result_json, indent=2)}")  # ← added
                     tasks = result_json.get("tasks", [])
+                    
+                    # Log the full raw response
+                    logger.info(f"tasks_ready raw: {response.text}")
+                    logger.info(f"Number of tasks in response: {len(tasks)}")
+                    
+                    for task in tasks:
+                        logger.info(f"Task status: {task.get('status_code')}, results: {task.get('result')}")
+                        if task.get("status_code") == 20000 and task.get("result"):
+                            for result in task["result"]:
+                                logger.info(f"Available result id: {result.get('id')} vs looking for: {task_id}")
 
                     for task in tasks:
                         if task.get("status_code") == 20000 and task.get("result"):
