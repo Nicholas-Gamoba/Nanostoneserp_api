@@ -129,7 +129,7 @@ class SerpService:
     async def _wait_for_task_ready(
         self,
         task_id: str,
-        max_retries: int = 20,
+        max_retries: int = 40,
         poll_interval: int = 15,
     ) -> Optional[str]:
         """Poll tasks_ready until our task_id appears, return permanent id"""
