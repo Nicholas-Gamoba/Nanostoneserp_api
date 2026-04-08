@@ -1,6 +1,5 @@
 import logging
 import uvicorn
-import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
