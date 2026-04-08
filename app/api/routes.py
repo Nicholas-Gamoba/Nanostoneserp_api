@@ -30,8 +30,6 @@ async def run_serp_and_notify(
     try:
         results = await serp_service.fetch_serp_results(
             keyword=body.keyword,
-            country=body.country,
-            language=body.language,
         )
 
         end_time = datetime.now()
