@@ -2,9 +2,11 @@
 import logging
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
+import httpx
 from pydantic import BaseModel
 from app.services.webhook_service import WebhookService
 from app.services.serp_service import SerpService
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,60 @@ async def run_serp_search(
         "keyword_id": body.keyword_id,
         "keyword": body.keyword,
         "message": "SERP search started, results will be sent via webhook",
+    }
+
+
+@router.post("/serp/refresh-all")
+async def refresh_all_keywords(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """Fetch all keywords from DB and kick off a SERP search for each"""
+    cron_secret = request.headers.get("X-Cron-Secret")
+    if cron_secret != settings.CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        import asyncpg
+
+        conn = await asyncpg.connect(settings.DATABASE_URL)
+        rows = await conn.fetch('SELECT id, keyword FROM "SEOKeyword" ORDER BY id')
+        await conn.close()
+        keywords = [{"id": row["id"], "keyword": row["keyword"]} for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch keywords from DB: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch keywords: {e}")
+
+    if not keywords:
+        return {"status": "no_keywords", "message": "No keywords found"}
+
+    logger.info(f"Queueing {len(keywords)} keywords for refresh...")
+
+    for kw in keywords:
+        start_time = datetime.now()
+        job_id = f"serp_{kw['id']}_{int(start_time.timestamp())}"
+
+        body = SerpRequest(
+            keyword_id=kw["id"],
+            keyword=kw["keyword"],
+            country="Denmark",
+            language="Danish",
+        )
+
+        background_tasks.add_task(
+            run_serp_and_notify,
+            job_id=job_id,
+            body=body,
+            callback_url=settings.VERCEL_WEBHOOK_URL,
+            start_time=start_time,
+        )
+
+        logger.info(f"Queued job_id: {job_id} for keyword: '{kw['keyword']}'")
+
+    return {
+        "status": "queued",
+        "keyword_count": len(keywords),
+        "message": f"Queued {len(keywords)} keywords for refresh",
     }
 
 
