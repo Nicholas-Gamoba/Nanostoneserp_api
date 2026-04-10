@@ -24,19 +24,16 @@ class RateLimiter:
     async def acquire(self):
         async with self._lock:
             now = datetime.utcnow()
-            # Drop timestamps older than 60s
             while self._timestamps and self._timestamps[0] < now - timedelta(
                 seconds=60
             ):
                 self._timestamps.popleft()
 
             if len(self._timestamps) >= self.max_per_minute:
-                # Wait until the oldest request falls outside the window
                 wait_until = self._timestamps[0] + timedelta(seconds=60)
                 wait_seconds = (wait_until - now).total_seconds() + 0.5
                 logger.info(f"Rate limit reached — waiting {wait_seconds:.1f}s")
                 await asyncio.sleep(wait_seconds)
-                # Re-clean after sleep
                 now = datetime.utcnow()
                 while self._timestamps and self._timestamps[0] < now - timedelta(
                     seconds=60
@@ -67,46 +64,70 @@ class SerpService:
         keyword: str,
         depth: int = 100,
     ) -> list:
-        """Full flow: create task → wait for ready → fetch results → parse items"""
+        """Single keyword: create task → wait → fetch → parse"""
+        results = await self.fetch_serp_results_bulk([keyword], depth=depth)
+        return results.get(keyword, [])
 
+    async def fetch_serp_results_bulk(
+        self,
+        keywords: list[str],
+        depth: int = 100,
+    ) -> dict[str, list]:
+        """Bulk flow: submit all keywords in one batch → poll all tasks together → fetch results"""
+
+        # Build batch payload — all keywords in a single API call
         payload = [
             {
-                "keyword": keyword,
+                "keyword": kw,
                 "location_code": 2208,
                 "language_code": "da",
                 "depth": depth,
             }
+            for kw in keywords
         ]
 
-        # Acquire rate limit slot before hitting the API
         await _rate_limiter.acquire()
         task_ids = await self._create_task(payload)
         if not task_ids:
             raise RuntimeError(
-                f"Failed to create DataForSEO task for keyword: '{keyword}'"
+                f"Failed to create batch tasks for {len(keywords)} keywords"
             )
 
-        task_id, cost = task_ids[0]
-        logger.info(f"Task created — id: {task_id}, estimated cost: ${cost}")
+        logger.info(f"Created {len(task_ids)} tasks in one batch call")
 
-        permanent_id = await self._wait_for_task_ready(task_id)
-        if not permanent_id:
-            raise RuntimeError(f"Task {task_id} never became ready")
+        # Map task_id -> keyword for result assembly
+        task_to_keyword = {
+            task_id: keywords[i] for i, (task_id, _) in enumerate(task_ids)
+        }
 
-        raw = await self._get_task_result(permanent_id)
-        if not raw:
-            raise RuntimeError(f"Failed to fetch results for task {permanent_id}")
+        # Poll all tasks together with a shared loop
+        ready_ids = await self._wait_for_tasks_ready_bulk(
+            [task_id for task_id, _ in task_ids]
+        )
 
-        items = self._parse_items(raw)
-        logger.info(f"Parsed {len(items)} SERP items for keyword: '{keyword}'")
-        return items
+        # Fetch all ready results in parallel
+        all_items: dict[str, list] = {kw: [] for kw in keywords}
+
+        async def fetch_one(task_id: str):
+            keyword = task_to_keyword.get(task_id, "unknown")
+            raw = await self._get_task_result(task_id)
+            if raw:
+                items = self._parse_items(raw)
+                logger.info(f"Got {len(items)} results for '{keyword}'")
+                all_items[keyword] = items
+            else:
+                logger.error(f"Failed to fetch results for '{keyword}'")
+
+        await asyncio.gather(*[fetch_one(task_id) for task_id in ready_ids.values()])
+
+        return all_items
 
     # ------------------------------------------------------------------
     # PRIVATE — API calls
     # ------------------------------------------------------------------
 
     async def _create_task(self, payload: list) -> Optional[list]:
-        """POST task to DataForSEO and return list of (task_id, cost) tuples"""
+        """POST task(s) to DataForSEO and return list of (task_id, cost) tuples"""
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -136,19 +157,25 @@ class SerpService:
             logger.error(f"Error creating task: {e}")
             return None
 
-    async def _wait_for_task_ready(
+    async def _wait_for_tasks_ready_bulk(
         self,
-        task_id: str,
+        task_ids: list[str],
         max_retries: int = 40,
         poll_interval: int = 15,
-    ) -> Optional[str]:
-        """Poll tasks_ready until our task_id appears, return permanent id"""
-        logger.info(f"Waiting for task {task_id} to be ready...")
+    ) -> dict[str, str]:
+        """Poll tasks_ready once for all tasks together. Returns map of task_id -> task_id."""
+        pending = set(task_ids)
+        ready: dict[str, str] = {}
+
+        logger.info(f"Waiting for {len(pending)} tasks to be ready...")
         await asyncio.sleep(10)
 
         for attempt in range(max_retries):
+            if not pending:
+                break
+
             try:
-                # Rate limit the polling calls too
+                # One tasks_ready call covers all pending tasks
                 await _rate_limiter.acquire()
                 async with httpx.AsyncClient() as client:
                     response = await client.get(
@@ -159,52 +186,72 @@ class SerpService:
                     )
 
                 if response.status_code == 200:
-                    tasks = response.json().get("tasks", [])
-
-                    for task in tasks:
+                    for task in response.json().get("tasks", []):
                         status_code = task.get("status_code", 0)
 
                         if status_code == 20000 and task.get("result"):
                             for result in task["result"]:
                                 result_id = result.get("id")
-                                if result_id == task_id:
-                                    logger.info(f"Task {task_id} is ready")
-                                    return result_id
+                                if result_id in pending:
+                                    ready[result_id] = result_id
+                                    pending.discard(result_id)
+                                    logger.info(
+                                        f"Task {result_id} ready ({len(ready)}/{len(task_ids)})"
+                                    )
 
                         elif status_code == 40202:
-                            # Rate limit error — back off and retry instead of failing
                             logger.warning(
-                                f"Rate limit hit while polling — backing off 60s"
+                                "Rate limit hit while polling — backing off 60s"
                             )
                             await asyncio.sleep(60)
                             break
 
-                        elif status_code >= 40000:
-                            logger.error(
-                                f"Task failed with status {status_code}: {task.get('status_message')}"
+                # Direct-check tasks that are still pending after attempt 2
+                # to handle cases where tasks_ready misses them
+                if attempt >= 2:
+                    for task_id in list(pending):
+                        await _rate_limiter.acquire()
+                        async with httpx.AsyncClient() as client:
+                            direct = await client.get(
+                                f"{API_BASE_URL}/task_get/advanced/{task_id}",
+                                auth=self.auth,
+                                headers=self.headers,
+                                timeout=30.0,
                             )
-                            # Don't return None immediately — the error may be on a
-                            # different task in the list, not ours
-                            continue
-
-                    logger.info(
-                        f"Task {task_id} not ready yet (attempt {attempt + 1}/{max_retries})"
-                    )
-
-                else:
-                    logger.warning(
-                        f"tasks_ready poll failed — {response.status_code}: {response.text}"
-                    )
+                        if direct.status_code == 200:
+                            for task in direct.json().get("tasks", []):
+                                if task.get("status_code") == 20000:
+                                    ready[task_id] = task_id
+                                    pending.discard(task_id)
+                                    logger.info(
+                                        f"Task {task_id} ready via direct fetch"
+                                    )
 
             except Exception as e:
-                logger.error(f"Error polling tasks_ready: {e}")
+                logger.error(f"Error in bulk poll attempt {attempt + 1}: {e}")
 
-            await asyncio.sleep(poll_interval)
+            if pending:
+                logger.info(
+                    f"Still waiting for {len(pending)} tasks (attempt {attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(poll_interval)
 
-        logger.error(
-            f"Task {task_id} did not become ready after {max_retries} attempts"
+        if pending:
+            logger.warning(f"{len(pending)} tasks never became ready: {pending}")
+
+        return ready
+
+    async def _wait_for_task_ready(
+        self,
+        task_id: str,
+        max_retries: int = 40,
+        poll_interval: int = 15,
+    ) -> Optional[str]:
+        """Single task polling — kept for backwards compatibility"""
+        result = await self._wait_for_tasks_ready_bulk(
+            [task_id], max_retries, poll_interval
         )
-        return None
+        return result.get(task_id)
 
     async def _get_task_result(self, task_id: str) -> Optional[dict]:
         try:
