@@ -261,7 +261,7 @@ class SerpService:
                     f"{API_BASE_URL}/task_get/advanced/{task_id}",
                     auth=self.auth,
                     headers=self.headers,
-                    timeout=30.0,
+                    timeout=120.0,
                 )
 
             if response.status_code == 200:
