@@ -306,8 +306,6 @@ class SerpService:
                                 "url": item.get("url"),
                                 "title": item.get("title"),
                                 "description": item.get("description"),
-                                "images": item.get("images"),
-                                "data": item,
                             }
                         )
         except Exception as e:
