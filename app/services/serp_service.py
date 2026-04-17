@@ -44,7 +44,7 @@ class SerpService:
         self,
         keywords: list[dict],  # [{"id": int, "keyword": str}, ...]
         depth: int = 100,
-        on_complete=None,       # async callback(job: dict) when all results arrive
+        on_complete=None,  # async callback(job: dict) when all results arrive
     ) -> str:
         """
         Submit all keywords to DataForSEO with a postback URL.
@@ -59,20 +59,18 @@ class SerpService:
             "status": "processing",
             "created_at": time.time(),
             "last_postback_at": time.time(),
-            "keywords": keywords,           # full list with ids
+            "keywords": keywords,  # full list with ids
             "keyword_map": {kw["keyword"]: kw["id"] for kw in keywords},
             "depth": depth,
-            "on_complete": on_complete,     # stored for later invocation
-            "results": {},                  # keyword -> list[item]
+            "on_complete": on_complete,  # stored for later invocation
+            "results": {},  # keyword -> list[item]
             "processed_count": 0,
         }
 
         asyncio.create_task(self._submit_all(job_id))
         asyncio.create_task(self._watchdog(job_id))
 
-        logger.info(
-            f"Bulk job {job_id} created — {len(keywords)} keywords, tag={tag}"
-        )
+        logger.info(f"Bulk job {job_id} created — {len(keywords)} keywords, tag={tag}")
         return job_id
 
     def get_job_status(self, job_id: str) -> Optional[dict]:
@@ -98,9 +96,7 @@ class SerpService:
             logger.error("Postback missing tag — ignoring")
             return False
 
-        job = next(
-            (j for j in active_jobs.values() if j["tag"] == tag), None
-        )
+        job = next((j for j in active_jobs.values() if j["tag"] == tag), None)
         if not job:
             logger.warning(f"No job found for postback tag={tag}")
             return False
@@ -137,7 +133,7 @@ class SerpService:
         client = get_http_client()
 
         for i in range(0, len(keywords), batch_size):
-            batch = keywords[i:i + batch_size]
+            batch = keywords[i : i + batch_size]
             payload = [
                 {
                     "keyword": kw,
@@ -145,7 +141,7 @@ class SerpService:
                     "language_code": "da",
                     "depth": depth,
                     "tag": tag,
-                    "postback_url": f"{settings.API_BASE_URL}/serp/postback",
+                    "postback_url": f"{settings.API_BASE_URL}/api/serp/postback",
                     "postback_data": "advanced",
                 }
                 for kw in batch
