@@ -21,77 +21,29 @@ class SerpRequest(BaseModel):
     language: str
 
 
-async def run_serp_and_notify(
-    job_id: str,
-    body: SerpRequest,
-    callback_url: str | None,
-    start_time: datetime,
+# ------------------------------------------------------------------
+# Webhook helpers
+# ------------------------------------------------------------------
+
+
+async def _send_result_webhooks(
+    job: dict, callback_url: str | None, start_time: datetime
 ):
-    """Background task: fetch SERP results then fire webhook"""
-    try:
-        results = await serp_service.fetch_serp_results(
-            keyword=body.keyword,
-        )
-
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
-
-        logger.info(f"SERP search complete — {len(results)} items in {duration:.2f}s")
-
-        result = {
-            "status": "success",
-            "job_id": job_id,
-            "keyword_id": body.keyword_id,
-            "keyword": body.keyword,
-            "country": body.country,
-            "language": body.language,
-            "serp_date": end_time.isoformat(),
-            "items": results,
-            "item_count": len(results),
-            "started_at": start_time.isoformat(),
-            "completed_at": end_time.isoformat(),
-            "duration_seconds": duration,
-        }
-
-        await webhook_service.send_webhook(
-            result_data=result,
-            origin_url=callback_url,
-            webhook_path="/api/webhook/serp-completed",
-        )
-
-    except Exception as e:
-        logger.error(f"Background SERP task failed for job_id {job_id}: {e}")
-
-
-async def run_bulk_refresh(
-    keywords: list[dict],
-    callback_url: str | None,
-    start_time: datetime,
-):
-    """Background task: fetch all keywords in one batch then fire webhooks"""
-    keyword_strings = [kw["keyword"] for kw in keywords]
-    keyword_id_map = {kw["keyword"]: kw["id"] for kw in keywords}
-
-    logger.info(f"Starting bulk refresh for {len(keywords)} keywords...")
-
-    try:
-        all_results = await serp_service.fetch_serp_results_bulk(keyword_strings)
-    except Exception as e:
-        logger.error(f"Bulk SERP refresh failed: {e}")
-        return
-
+    """Fire one webhook per keyword once a bulk job completes."""
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
-    logger.info(f"Bulk refresh complete in {duration:.2f}s")
+    keyword_map = job.get("keyword_map", {})
 
-    # Fire one webhook per keyword with its results
-    for keyword, items in all_results.items():
-        keyword_id = keyword_id_map.get(keyword, 0)
-        job_id = f"serp_{keyword_id}_{int(start_time.timestamp())}"
+    logger.info(
+        f"Job {job['job_id']} complete in {duration:.2f}s — "
+        f"sending webhooks for {len(job['results'])} keywords"
+    )
 
+    for keyword, items in job["results"].items():
+        keyword_id = keyword_map.get(keyword, 0)
         result = {
             "status": "success",
-            "job_id": job_id,
+            "job_id": job["job_id"],
             "keyword_id": keyword_id,
             "keyword": keyword,
             "country": "Denmark",
@@ -103,7 +55,6 @@ async def run_bulk_refresh(
             "completed_at": end_time.isoformat(),
             "duration_seconds": duration,
         }
-
         try:
             await webhook_service.send_webhook(
                 result_data=result,
@@ -115,25 +66,33 @@ async def run_bulk_refresh(
             logger.error(f"Webhook failed for '{keyword}': {e}")
 
 
+# ------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------
+
+
 @router.post("/serp/search")
 async def run_serp_search(
     body: SerpRequest,
     request: Request,
     background_tasks: BackgroundTasks,
 ):
-    """Kick off a single SERP search in the background, return job_id immediately"""
+    """
+    Kick off a single-keyword SERP search.
+    Internally uses the same bulk/postback path — returns job_id immediately.
+    """
     start_time = datetime.now()
-    job_id = f"serp_{body.keyword_id}_{int(start_time.timestamp())}"
+    callback_url = request.headers.get("X-Callback-URL")
 
-    logger.info(f"SERP job queued — job_id: {job_id}, keyword: '{body.keyword}'")
+    async def on_complete(job: dict):
+        await _send_result_webhooks(job, callback_url, start_time)
 
-    background_tasks.add_task(
-        run_serp_and_notify,
-        job_id=job_id,
-        body=body,
-        callback_url=request.headers.get("X-Callback-URL"),
-        start_time=start_time,
+    job_id = await serp_service.create_bulk_job(
+        keywords=[{"id": body.keyword_id, "keyword": body.keyword}],
+        on_complete=on_complete,
     )
+
+    logger.info(f"Single SERP job queued — job_id: {job_id}, keyword: '{body.keyword}'")
 
     return {
         "status": "queued",
@@ -149,7 +108,7 @@ async def refresh_all_keywords(
     request: Request,
     background_tasks: BackgroundTasks,
 ):
-    """Fetch all keywords from DB and refresh them all in a single batch"""
+    """Fetch all keywords from DB and refresh them all via postback."""
     cron_secret = request.headers.get("X-Cron-Secret")
     if cron_secret != settings.CRON_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -169,20 +128,44 @@ async def refresh_all_keywords(
         return {"status": "no_keywords", "message": "No keywords found"}
 
     start_time = datetime.now()
-    logger.info(f"Queueing {len(keywords)} keywords for bulk refresh...")
+    callback_url = settings.VERCEL_WEBHOOK_URL
 
-    background_tasks.add_task(
-        run_bulk_refresh,
+    async def on_complete(job: dict):
+        await _send_result_webhooks(job, callback_url, start_time)
+
+    job_id = await serp_service.create_bulk_job(
         keywords=keywords,
-        callback_url=settings.VERCEL_WEBHOOK_URL,
-        start_time=start_time,
+        on_complete=on_complete,
     )
+
+    logger.info(f"Bulk refresh queued — job_id: {job_id}, {len(keywords)} keywords")
 
     return {
         "status": "queued",
+        "job_id": job_id,
         "keyword_count": len(keywords),
         "message": f"Bulk refresh started for {len(keywords)} keywords",
     }
+
+
+@router.post("/serp/postback")
+async def serp_postback(request: Request, background_tasks: BackgroundTasks):
+    """
+    DataForSEO calls this endpoint when a task result is ready.
+    Respond immediately (< 1s) — actual processing happens in background.
+    """
+    data = await request.json()
+    background_tasks.add_task(serp_service.handle_postback, data)
+    return {"status": "ok"}
+
+
+@router.get("/serp/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    """Poll job progress — useful for debugging or UI status indicators."""
+    status = serp_service.get_job_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return status
 
 
 @router.get("/serp/health")
