@@ -6,6 +6,8 @@ from pydantic import BaseModel
 from app.services.webhook_service import WebhookService
 from app.services.serp_service import SerpService
 from app.config import settings
+import gzip
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +152,15 @@ async def refresh_all_keywords(
 
 @router.post("/serp/postback")
 async def serp_postback(request: Request, background_tasks: BackgroundTasks):
-    """
-    DataForSEO calls this endpoint when a task result is ready.
-    Respond immediately (< 1s) — actual processing happens in background.
-    """
-    data = await request.json()
+    body = await request.body()
+
+    try:
+        decompressed = gzip.decompress(body)
+        data = json.loads(decompressed)
+    except gzip.BadGzipFile:
+        # Fallback for uncompressed payloads
+        data = json.loads(body)
+
     background_tasks.add_task(serp_service.handle_postback, data)
     return {"status": "ok"}
 
