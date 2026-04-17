@@ -12,6 +12,16 @@ logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://api.dataforseo.com/v3/serp/google/organic"
 
+# Shared client — one connection pool for the lifetime of the process
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=120.0)
+    return _http_client
+
 
 class RateLimiter:
     """Sliding window rate limiter — max N requests per 60 seconds"""
@@ -24,9 +34,8 @@ class RateLimiter:
     async def acquire(self):
         async with self._lock:
             now = datetime.utcnow()
-            while self._timestamps and self._timestamps[0] < now - timedelta(
-                seconds=60
-            ):
+            cutoff = now - timedelta(seconds=60)
+            while self._timestamps and self._timestamps[0] < cutoff:
                 self._timestamps.popleft()
 
             if len(self._timestamps) >= self.max_per_minute:
@@ -35,16 +44,25 @@ class RateLimiter:
                 logger.info(f"Rate limit reached — waiting {wait_seconds:.1f}s")
                 await asyncio.sleep(wait_seconds)
                 now = datetime.utcnow()
-                while self._timestamps and self._timestamps[0] < now - timedelta(
-                    seconds=60
-                ):
+                cutoff = now - timedelta(seconds=60)
+                while self._timestamps and self._timestamps[0] < cutoff:
                     self._timestamps.popleft()
 
             self._timestamps.append(datetime.utcnow())
 
 
-# Module-level singleton — shared across all SerpService instances
+# Module-level singletons
 _rate_limiter = RateLimiter(max_per_minute=18)
+
+# Max 3 result-fetches in memory at once
+_fetch_semaphore = asyncio.Semaphore(3)
+
+# Only one chunk polling loop runs at a time — prevents concurrent polling storms
+_bulk_semaphore = asyncio.Semaphore(1)
+
+# How many keywords to process per chunk.
+# At 100 results/keyword, 15 keywords ≈ ~15MB peak per chunk — safe for 512MB Render tier.
+CHUNK_SIZE = 15
 
 
 class SerpService:
@@ -64,7 +82,7 @@ class SerpService:
         keyword: str,
         depth: int = 100,
     ) -> list:
-        """Single keyword: create task → wait → fetch → parse"""
+        """Single keyword: convenience wrapper around bulk."""
         results = await self.fetch_serp_results_bulk([keyword], depth=depth)
         return results.get(keyword, [])
 
@@ -73,9 +91,49 @@ class SerpService:
         keywords: list[str],
         depth: int = 100,
     ) -> dict[str, list]:
-        """Bulk flow: submit all keywords in one batch → poll all tasks together → fetch results"""
+        """
+        Process any number of keywords safely on a 512MB instance.
 
-        # Build batch payload — all keywords in a single API call
+        Strategy:
+          - Split keywords into chunks of CHUNK_SIZE
+          - Process each chunk fully (submit → poll → fetch) before starting the next
+          - Only one chunk is in memory at a time
+          - Within a chunk, result fetches are bounded to 3 concurrent responses
+
+        For 2500 keywords at CHUNK_SIZE=15: ~167 sequential chunks.
+        Each chunk takes ~2-5 minutes (DataForSEO processing + polling).
+        Total wall time: several hours — callers should run this as a background job.
+        """
+        all_items: dict[str, list] = {kw: [] for kw in keywords}
+
+        chunks = [
+            keywords[i : i + CHUNK_SIZE] for i in range(0, len(keywords), CHUNK_SIZE)
+        ]
+        total_chunks = len(chunks)
+        logger.info(
+            f"Processing {len(keywords)} keywords in {total_chunks} chunks of {CHUNK_SIZE}"
+        )
+
+        for i, chunk in enumerate(chunks):
+            logger.info(f"--- Chunk {i + 1}/{total_chunks} ({len(chunk)} keywords) ---")
+            async with _bulk_semaphore:
+                chunk_results = await self._fetch_chunk(chunk, depth)
+            all_items.update(chunk_results)
+            del chunk_results  # free memory immediately before next chunk
+
+            # Brief pause between chunks — lets GC run and avoids API burst
+            if i < total_chunks - 1:
+                await asyncio.sleep(2)
+
+        logger.info(f"All {len(keywords)} keywords complete.")
+        return all_items
+
+    # ------------------------------------------------------------------
+    # PRIVATE — chunk orchestration
+    # ------------------------------------------------------------------
+
+    async def _fetch_chunk(self, keywords: list[str], depth: int) -> dict[str, list]:
+        """Submit one chunk, poll until ready, fetch results, return parsed items."""
         payload = [
             {
                 "keyword": kw,
@@ -89,55 +147,51 @@ class SerpService:
         await _rate_limiter.acquire()
         task_ids = await self._create_task(payload)
         if not task_ids:
-            raise RuntimeError(
-                f"Failed to create batch tasks for {len(keywords)} keywords"
-            )
+            logger.error(f"Failed to create tasks for chunk: {keywords}")
+            return {kw: [] for kw in keywords}
 
-        logger.info(f"Created {len(task_ids)} tasks in one batch call")
+        logger.info(f"Created {len(task_ids)} tasks for chunk")
 
-        # Map task_id -> keyword for result assembly
         task_to_keyword = {
             task_id: keywords[i] for i, (task_id, _) in enumerate(task_ids)
         }
 
-        # Poll all tasks together with a shared loop
         ready_ids = await self._wait_for_tasks_ready_bulk(
             [task_id for task_id, _ in task_ids]
         )
 
-        # Fetch all ready results in parallel
-        all_items: dict[str, list] = {kw: [] for kw in keywords}
+        chunk_items: dict[str, list] = {kw: [] for kw in keywords}
 
         async def fetch_one(task_id: str):
-            keyword = task_to_keyword.get(task_id, "unknown")
-            raw = await self._get_task_result(task_id)
-            if raw:
-                items = self._parse_items(raw)
-                logger.info(f"Got {len(items)} results for '{keyword}'")
-                all_items[keyword] = items
-            else:
-                logger.error(f"Failed to fetch results for '{keyword}'")
+            async with _fetch_semaphore:
+                keyword = task_to_keyword.get(task_id, "unknown")
+                raw = await self._get_task_result(task_id)
+                if raw:
+                    items = self._parse_items(raw)
+                    logger.info(f"  '{keyword}': {len(items)} results")
+                    chunk_items[keyword] = items
+                    del raw  # release large dict immediately
+                else:
+                    logger.error(f"  '{keyword}': failed to fetch results")
 
-        await asyncio.gather(*[fetch_one(task_id) for task_id in ready_ids.values()])
-
-        return all_items
+        await asyncio.gather(*[fetch_one(tid) for tid in ready_ids.values()])
+        return chunk_items
 
     # ------------------------------------------------------------------
     # PRIVATE — API calls
     # ------------------------------------------------------------------
 
     async def _create_task(self, payload: list) -> Optional[list]:
-        """POST task(s) to DataForSEO and return list of (task_id, cost) tuples"""
+        """POST task(s) to DataForSEO and return list of (task_id, cost) tuples."""
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{API_BASE_URL}/task_post",
-                    auth=self.auth,
-                    headers=self.headers,
-                    content=json.dumps(payload),
-                    timeout=60.0,
-                )
-
+            client = get_http_client()
+            response = await client.post(
+                f"{API_BASE_URL}/task_post",
+                auth=self.auth,
+                headers=self.headers,
+                content=json.dumps(payload),
+                timeout=60.0,
+            )
             if response.status_code == 200:
                 result = response.json()
                 task_ids = [
@@ -152,7 +206,6 @@ class SerpService:
                     f"Task creation failed — {response.status_code}: {response.text}"
                 )
                 return None
-
         except Exception as e:
             logger.error(f"Error creating task: {e}")
             return None
@@ -163,32 +216,30 @@ class SerpService:
         max_retries: int = 40,
         poll_interval: int = 15,
     ) -> dict[str, str]:
-        """Poll tasks_ready once for all tasks together. Returns map of task_id -> task_id."""
+        """Poll tasks_ready until all task_ids in this chunk are ready."""
         pending = set(task_ids)
         ready: dict[str, str] = {}
+        client = get_http_client()
 
-        logger.info(f"Waiting for {len(pending)} tasks to be ready...")
-        await asyncio.sleep(10)
+        logger.info(f"Polling for {len(pending)} tasks to become ready...")
+        await asyncio.sleep(10)  # DataForSEO needs a moment before tasks appear
 
         for attempt in range(max_retries):
             if not pending:
                 break
 
             try:
-                # One tasks_ready call covers all pending tasks
                 await _rate_limiter.acquire()
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        "https://api.dataforseo.com/v3/serp/tasks_ready",
-                        auth=self.auth,
-                        headers=self.headers,
-                        timeout=30.0,
-                    )
+                response = await client.get(
+                    "https://api.dataforseo.com/v3/serp/tasks_ready",
+                    auth=self.auth,
+                    headers=self.headers,
+                    timeout=30.0,
+                )
 
                 if response.status_code == 200:
                     for task in response.json().get("tasks", []):
                         status_code = task.get("status_code", 0)
-
                         if status_code == 20000 and task.get("result"):
                             for result in task["result"]:
                                 result_id = result.get("id")
@@ -196,9 +247,9 @@ class SerpService:
                                     ready[result_id] = result_id
                                     pending.discard(result_id)
                                     logger.info(
-                                        f"Task {result_id} ready ({len(ready)}/{len(task_ids)})"
+                                        f"  Task {result_id} ready "
+                                        f"({len(ready)}/{len(task_ids)})"
                                     )
-
                         elif status_code == 40202:
                             logger.warning(
                                 "Rate limit hit while polling — backing off 60s"
@@ -206,33 +257,33 @@ class SerpService:
                             await asyncio.sleep(60)
                             break
 
-                # Direct-check tasks that are still pending after attempt 2
-                # to handle cases where tasks_ready misses them
+                # Direct-check stragglers after attempt 2 to handle
+                # cases where tasks_ready misses them
                 if attempt >= 2:
                     for task_id in list(pending):
                         await _rate_limiter.acquire()
-                        async with httpx.AsyncClient() as client:
-                            direct = await client.get(
-                                f"{API_BASE_URL}/task_get/advanced/{task_id}",
-                                auth=self.auth,
-                                headers=self.headers,
-                                timeout=30.0,
-                            )
+                        direct = await client.get(
+                            f"{API_BASE_URL}/task_get/advanced/{task_id}",
+                            auth=self.auth,
+                            headers=self.headers,
+                            timeout=30.0,
+                        )
                         if direct.status_code == 200:
                             for task in direct.json().get("tasks", []):
                                 if task.get("status_code") == 20000:
                                     ready[task_id] = task_id
                                     pending.discard(task_id)
                                     logger.info(
-                                        f"Task {task_id} ready via direct fetch"
+                                        f"  Task {task_id} ready via direct fetch"
                                     )
 
             except Exception as e:
-                logger.error(f"Error in bulk poll attempt {attempt + 1}: {e}")
+                logger.error(f"Error in poll attempt {attempt + 1}: {e}")
 
             if pending:
                 logger.info(
-                    f"Still waiting for {len(pending)} tasks (attempt {attempt + 1}/{max_retries})"
+                    f"  Still waiting for {len(pending)} tasks "
+                    f"(attempt {attempt + 1}/{max_retries})"
                 )
                 await asyncio.sleep(poll_interval)
 
@@ -247,7 +298,7 @@ class SerpService:
         max_retries: int = 40,
         poll_interval: int = 15,
     ) -> Optional[str]:
-        """Single task polling — kept for backwards compatibility"""
+        """Single task polling — backwards compatibility wrapper."""
         result = await self._wait_for_tasks_ready_bulk(
             [task_id], max_retries, poll_interval
         )
@@ -256,14 +307,13 @@ class SerpService:
     async def _get_task_result(self, task_id: str) -> Optional[dict]:
         try:
             await _rate_limiter.acquire()
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"{API_BASE_URL}/task_get/advanced/{task_id}",
-                    auth=self.auth,
-                    headers=self.headers,
-                    timeout=120.0,
-                )
-
+            client = get_http_client()
+            response = await client.get(
+                f"{API_BASE_URL}/task_get/advanced/{task_id}",
+                auth=self.auth,
+                headers=self.headers,
+                timeout=120.0,
+            )
             if response.status_code == 200:
                 logger.info(f"Fetched results for task {task_id}")
                 return response.json()
@@ -272,7 +322,6 @@ class SerpService:
                     f"Result fetch failed — {response.status_code}: {response.text}"
                 )
                 return None
-
         except httpx.TimeoutException as e:
             logger.error(f"Timeout fetching task result: {e}")
             return None
@@ -288,12 +337,10 @@ class SerpService:
     # ------------------------------------------------------------------
 
     def _parse_items(self, raw: dict) -> list:
-        """Extract and normalise SERP items from the raw DataForSEO response"""
+        """Extract and normalise SERP items from the raw DataForSEO response."""
         items = []
-
         try:
-            tasks = raw.get("tasks", [])
-            for task in tasks:
+            for task in raw.get("tasks", []):
                 for result in task.get("result", []):
                     for item in result.get("items", []):
                         items.append(
@@ -310,5 +357,4 @@ class SerpService:
                         )
         except Exception as e:
             logger.error(f"Error parsing SERP items: {e}")
-
         return items
