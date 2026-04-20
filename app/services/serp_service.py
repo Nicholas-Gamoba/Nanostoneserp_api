@@ -30,6 +30,7 @@ _job_callbacks: Dict[str, Dict[str, Any]] = {}
 
 async def _get_db():
     import asyncpg
+
     return await asyncpg.connect(settings.DATABASE_URL)
 
 
@@ -47,8 +48,8 @@ class SerpService:
 
     async def create_bulk_job(
         self,
-        keywords: list[dict],           # [{"id": int, "keyword": str}, ...]
-        depth: int = 100,
+        keywords: list[dict],  # [{"id": int, "keyword": str}, ...]
+        depth: int = 20,
         on_keyword_complete: Optional[Callable] = None,
         on_complete: Optional[Callable] = None,
     ) -> str:
@@ -56,6 +57,7 @@ class SerpService:
         Persist job and keywords to Postgres, then submit to DataForSEO.
         Returns job_id immediately. Survives Render restarts.
         """
+        depth = min(depth, 20)
         job_id = str(uuid.uuid4())
         tag = str(random.randint(1, 10_000_000))
 
@@ -66,7 +68,10 @@ class SerpService:
                 INSERT INTO serp_jobs (job_id, tag, status, depth, keywords_total, processed_count)
                 VALUES ($1, $2, 'processing', $3, $4, 0)
                 """,
-                job_id, tag, depth, len(keywords),
+                job_id,
+                tag,
+                depth,
+                len(keywords),
             )
             await conn.executemany(
                 """
@@ -125,15 +130,15 @@ class SerpService:
 
         conn = await _get_db()
         try:
-            job_row = await conn.fetchrow(
-                "SELECT * FROM serp_jobs WHERE tag = $1", tag
-            )
+            job_row = await conn.fetchrow("SELECT * FROM serp_jobs WHERE tag = $1", tag)
             if not job_row:
                 logger.warning(f"No job found for postback tag={tag}")
                 return False
 
             if job_row["status"] == "complete":
-                logger.info(f"Postback for already-complete job {job_row['job_id']} — ignoring")
+                logger.info(
+                    f"Postback for already-complete job {job_row['job_id']} — ignoring"
+                )
                 return True
 
             job_id = job_row["job_id"]
@@ -145,7 +150,8 @@ class SerpService:
                     SELECT keyword_id FROM serp_job_keywords
                     WHERE job_id = $1 AND keyword = $2
                     """,
-                    job_id, keyword,
+                    job_id,
+                    keyword,
                 )
                 if not kw_row:
                     logger.warning(
@@ -160,7 +166,8 @@ class SerpService:
                     UPDATE serp_job_keywords SET done = true
                     WHERE job_id = $1 AND keyword = $2
                     """,
-                    job_id, keyword,
+                    job_id,
+                    keyword,
                 )
                 await conn.execute(
                     """
@@ -176,7 +183,9 @@ class SerpService:
                 if callbacks.get("on_keyword_complete"):
                     try:
                         await callbacks["on_keyword_complete"](
-                            keyword, keyword_id, items,
+                            keyword,
+                            keyword_id,
+                            items,
                             {"job_id": job_id, "tag": tag},
                         )
                     except Exception as e:
@@ -204,13 +213,15 @@ class SerpService:
     # PRIVATE — submission
     # ------------------------------------------------------------------
 
-    async def _submit_all(self, job_id: str, keywords: list[dict], tag: str, depth: int):
+    async def _submit_all(
+        self, job_id: str, keywords: list[dict], tag: str, depth: int
+    ):
         client = get_http_client()
         batch_size = 100
         kw_strings = [kw["keyword"] for kw in keywords]
 
         for i in range(0, len(kw_strings), batch_size):
-            batch = kw_strings[i:i + batch_size]
+            batch = kw_strings[i : i + batch_size]
             payload = [
                 {
                     "keyword": kw,
