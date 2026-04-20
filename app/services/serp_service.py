@@ -230,7 +230,7 @@ class SerpService:
                     "depth": depth,
                     "tag": tag,
                     "postback_url": f"{settings.API_BASE_URL}/api/serp/postback",
-                    "postback_data": "advanced",
+                    "postback_data": "regular",
                 }
                 for kw in batch
             ]
