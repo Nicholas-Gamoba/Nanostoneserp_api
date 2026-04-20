@@ -4,8 +4,8 @@ import json
 import asyncio
 import httpx
 import uuid
-import time
 import random
+import datetime
 from typing import Optional, Dict, Any, Callable
 from app.config import settings
 
@@ -23,9 +23,14 @@ def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-# In-memory job store.
-# For persistence across Render restarts, replace with Redis or a DB table.
-active_jobs: Dict[str, Dict[str, Any]] = {}
+# In-memory store for callbacks ONLY.
+# All job/keyword state lives in Postgres and survives restarts.
+_job_callbacks: Dict[str, Dict[str, Any]] = {}
+
+
+async def _get_db():
+    import asyncpg
+    return await asyncpg.connect(settings.DATABASE_URL)
 
 
 class SerpService:
@@ -42,60 +47,75 @@ class SerpService:
 
     async def create_bulk_job(
         self,
-        keywords: list[dict],  # [{"id": int, "keyword": str}, ...]
+        keywords: list[dict],           # [{"id": int, "keyword": str}, ...]
         depth: int = 100,
-        on_keyword_complete: Optional[Callable] = None,  # async callback(keyword, keyword_id, items, job)
-        on_complete: Optional[Callable] = None,          # async callback(job) when ALL keywords done
+        on_keyword_complete: Optional[Callable] = None,
+        on_complete: Optional[Callable] = None,
     ) -> str:
         """
-        Submit all keywords to DataForSEO with a postback URL.
-        Returns job_id immediately — results arrive via handle_postback().
-
-        on_keyword_complete fires immediately for each keyword as its postback arrives.
-        on_complete fires once when all keywords are done (or watchdog triggers).
-        Results are NOT stored in memory — webhooks fire per-postback to keep RAM flat.
+        Persist job and keywords to Postgres, then submit to DataForSEO.
+        Returns job_id immediately. Survives Render restarts.
         """
         job_id = str(uuid.uuid4())
         tag = str(random.randint(1, 10_000_000))
 
-        active_jobs[job_id] = {
-            "job_id": job_id,
-            "tag": tag,
-            "status": "processing",
-            "created_at": time.time(),
-            "last_postback_at": time.time(),
-            "keywords": keywords,
-            "keyword_map": {kw["keyword"]: kw["id"] for kw in keywords},
-            "depth": depth,
+        conn = await _get_db()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO serp_jobs (job_id, tag, status, depth, keywords_total, processed_count)
+                VALUES ($1, $2, 'processing', $3, $4, 0)
+                """,
+                job_id, tag, depth, len(keywords),
+            )
+            await conn.executemany(
+                """
+                INSERT INTO serp_job_keywords (job_id, keyword_id, keyword, done)
+                VALUES ($1, $2, $3, false)
+                """,
+                [(job_id, kw["id"], kw["keyword"]) for kw in keywords],
+            )
+        finally:
+            await conn.close()
+
+        # Callbacks stay in memory — they are closures with runtime context
+        # (start_time, callback_url) that can't be serialised to DB anyway.
+        # If the process restarts, the watchdog will still complete the job
+        # via DB state; it just won't fire the webhook for missed keywords.
+        _job_callbacks[job_id] = {
             "on_keyword_complete": on_keyword_complete,
             "on_complete": on_complete,
-            # No "results" dict — we stream instead of accumulate
-            "processed_count": 0,
         }
 
-        asyncio.create_task(self._submit_all(job_id))
+        asyncio.create_task(self._submit_all(job_id, keywords, tag, depth))
         asyncio.create_task(self._watchdog(job_id))
 
         logger.info(f"Bulk job {job_id} created — {len(keywords)} keywords, tag={tag}")
         return job_id
 
-    def get_job_status(self, job_id: str) -> Optional[dict]:
-        job = active_jobs.get(job_id)
-        if not job:
+    async def get_job_status(self, job_id: str) -> Optional[dict]:
+        conn = await _get_db()
+        try:
+            row = await conn.fetchrow(
+                "SELECT * FROM serp_jobs WHERE job_id = $1", job_id
+            )
+        finally:
+            await conn.close()
+
+        if not row:
             return None
         return {
             "job_id": job_id,
-            "status": job["status"],
-            "keywords_total": len(job["keywords"]),
-            "keywords_done": job["processed_count"],
-            "created_at": job["created_at"],
+            "status": row["status"],
+            "keywords_total": row["keywords_total"],
+            "keywords_done": row["processed_count"],
+            "created_at": row["created_at"].timestamp(),
         }
 
     async def handle_postback(self, data: dict) -> bool:
         """
         Called by POST /serp/postback when DataForSEO delivers a result.
-        Fires on_keyword_complete immediately per keyword — does NOT accumulate results.
-        Fires on_complete once all keywords are processed.
+        Looks up job by tag from DB — survives restarts.
         """
         try:
             tag = data["tasks"][0]["data"]["tag"]
@@ -103,41 +123,80 @@ class SerpService:
             logger.error("Postback missing tag — ignoring")
             return False
 
-        job = next((j for j in active_jobs.values() if j["tag"] == tag), None)
-        if not job:
-            logger.warning(f"No job found for postback tag={tag}")
-            return False
+        conn = await _get_db()
+        try:
+            job_row = await conn.fetchrow(
+                "SELECT * FROM serp_jobs WHERE tag = $1", tag
+            )
+            if not job_row:
+                logger.warning(f"No job found for postback tag={tag}")
+                return False
 
-        job["last_postback_at"] = time.time()
+            if job_row["status"] == "complete":
+                logger.info(f"Postback for already-complete job {job_row['job_id']} — ignoring")
+                return True
 
-        parsed = self._parse_postback(data)
+            job_id = job_row["job_id"]
+            parsed = self._parse_postback(data)
 
-        for keyword, items in parsed.items():
-            job["processed_count"] += 1
-
-            keyword_id = job["keyword_map"].get(keyword)
-            if keyword_id is None:
-                logger.warning(
-                    f"Job {job['job_id']}: no keyword_id for '{keyword}' — skipping. "
-                    f"Sample keys: {list(job['keyword_map'].keys())[:3]}"
+            for keyword, items in parsed.items():
+                kw_row = await conn.fetchrow(
+                    """
+                    SELECT keyword_id FROM serp_job_keywords
+                    WHERE job_id = $1 AND keyword = $2
+                    """,
+                    job_id, keyword,
                 )
-                continue
-
-            # Fire webhook immediately — don't store items in RAM
-            if job.get("on_keyword_complete"):
-                try:
-                    await job["on_keyword_complete"](keyword, keyword_id, items, job)
-                except Exception as e:
-                    logger.error(
-                        f"Job {job['job_id']}: on_keyword_complete failed for '{keyword}': {e}"
+                if not kw_row:
+                    logger.warning(
+                        f"Job {job_id}: no keyword_id for '{keyword}' — skipping"
                     )
+                    continue
+
+                keyword_id = kw_row["keyword_id"]
+
+                await conn.execute(
+                    """
+                    UPDATE serp_job_keywords SET done = true
+                    WHERE job_id = $1 AND keyword = $2
+                    """,
+                    job_id, keyword,
+                )
+                await conn.execute(
+                    """
+                    UPDATE serp_jobs
+                    SET processed_count = processed_count + 1,
+                        last_postback_at = NOW()
+                    WHERE job_id = $1
+                    """,
+                    job_id,
+                )
+
+                callbacks = _job_callbacks.get(job_id, {})
+                if callbacks.get("on_keyword_complete"):
+                    try:
+                        await callbacks["on_keyword_complete"](
+                            keyword, keyword_id, items,
+                            {"job_id": job_id, "tag": tag},
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Job {job_id}: on_keyword_complete failed for '{keyword}': {e}"
+                        )
+
+            updated = await conn.fetchrow(
+                "SELECT processed_count, keywords_total FROM serp_jobs WHERE job_id = $1",
+                job_id,
+            )
+        finally:
+            await conn.close()
 
         logger.info(
-            f"Job {job['job_id']}: {job['processed_count']}/{len(job['keywords'])} done"
+            f"Job {job_id}: {updated['processed_count']}/{updated['keywords_total']} done"
         )
 
-        if job["processed_count"] >= len(job["keywords"]):
-            await self._complete_job(job["job_id"])
+        if updated["processed_count"] >= updated["keywords_total"]:
+            await self._complete_job(job_id)
 
         return True
 
@@ -145,19 +204,13 @@ class SerpService:
     # PRIVATE — submission
     # ------------------------------------------------------------------
 
-    async def _submit_all(self, job_id: str):
-        job = active_jobs.get(job_id)
-        if not job:
-            return
-
-        keywords = [kw["keyword"] for kw in job["keywords"]]
-        tag = job["tag"]
-        depth = job["depth"]
+    async def _submit_all(self, job_id: str, keywords: list[dict], tag: str, depth: int):
         client = get_http_client()
         batch_size = 100
+        kw_strings = [kw["keyword"] for kw in keywords]
 
-        for i in range(0, len(keywords), batch_size):
-            batch = keywords[i:i + batch_size]
+        for i in range(0, len(kw_strings), batch_size):
+            batch = kw_strings[i:i + batch_size]
             payload = [
                 {
                     "keyword": kw,
@@ -203,7 +256,7 @@ class SerpService:
             except Exception as e:
                 logger.error(f"Job {job_id}: submit exception — {e}")
 
-            if i + batch_size < len(keywords):
+            if i + batch_size < len(kw_strings):
                 await asyncio.sleep(1)
 
     # ------------------------------------------------------------------
@@ -212,21 +265,35 @@ class SerpService:
 
     async def _watchdog(self, job_id: str, timeout_seconds: int = 600):
         """
-        If no postback arrives for timeout_seconds, complete the job with
-        whatever has arrived so far.
+        Poll DB every 30s. Complete the job if no postback arrives
+        within timeout_seconds.
         """
         while True:
             await asyncio.sleep(30)
 
-            job = active_jobs.get(job_id)
-            if not job or job["status"] != "processing":
+            conn = await _get_db()
+            try:
+                row = await conn.fetchrow(
+                    """
+                    SELECT status, last_postback_at, processed_count, keywords_total
+                    FROM serp_jobs WHERE job_id = $1
+                    """,
+                    job_id,
+                )
+            finally:
+                await conn.close()
+
+            if not row or row["status"] != "processing":
                 return
 
-            silence = time.time() - job["last_postback_at"]
+            silence = (
+                datetime.datetime.now(datetime.timezone.utc) - row["last_postback_at"]
+            ).total_seconds()
+
             if silence >= timeout_seconds:
                 logger.warning(
                     f"Job {job_id} watchdog timeout — "
-                    f"{job['processed_count']}/{len(job['keywords'])} keywords received"
+                    f"{row['processed_count']}/{row['keywords_total']} keywords received"
                 )
                 await self._complete_job(job_id)
                 return
@@ -236,24 +303,33 @@ class SerpService:
     # ------------------------------------------------------------------
 
     async def _complete_job(self, job_id: str):
-        job = active_jobs.get(job_id)
-        if not job or job["status"] == "complete":
-            return
+        conn = await _get_db()
+        try:
+            row = await conn.fetchrow(
+                "SELECT status, processed_count, keywords_total FROM serp_jobs WHERE job_id = $1",
+                job_id,
+            )
+            if not row or row["status"] == "complete":
+                return
 
-        job["status"] = "complete"
+            await conn.execute(
+                "UPDATE serp_jobs SET status = 'complete' WHERE job_id = $1",
+                job_id,
+            )
+        finally:
+            await conn.close()
+
         logger.info(
             f"Job {job_id} complete — "
-            f"{job['processed_count']}/{len(job['keywords'])} keywords processed"
+            f"{row['processed_count']}/{row['keywords_total']} keywords processed"
         )
 
-        if job.get("on_complete"):
+        callbacks = _job_callbacks.pop(job_id, None)
+        if callbacks and callbacks.get("on_complete"):
             try:
-                await job["on_complete"](job)
+                await callbacks["on_complete"]({"job_id": job_id})
             except Exception as e:
                 logger.error(f"Job {job_id} on_complete callback failed: {e}")
-
-        # Clean up immediately — no results to hold onto anyway
-        active_jobs.pop(job_id, None)
 
     # ------------------------------------------------------------------
     # PRIVATE — parsing

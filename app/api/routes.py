@@ -1,5 +1,6 @@
 # app/api/routes.py
 import logging
+import asyncio
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
@@ -14,6 +15,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 webhook_service = WebhookService()
 serp_service = SerpService()
+
+# Limit concurrent outbound webhooks to avoid exhausting Vercel's Prisma connection pool
+_webhook_semaphore = asyncio.Semaphore(10)
 
 
 class SerpRequest(BaseModel):
@@ -32,34 +36,39 @@ def _make_keyword_complete_handler(callback_url: str | None, start_time: datetim
     """
     Returns an async callback that fires a webhook immediately when a single
     keyword's postback arrives. No results are held in memory.
+    Throttled to 10 concurrent webhooks via semaphore.
     """
-    async def on_keyword_complete(keyword: str, keyword_id: int, items: list, job: dict):
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
 
-        result = {
-            "status": "success",
-            "job_id": job["job_id"],
-            "keyword_id": keyword_id,
-            "keyword": keyword,
-            "country": "Denmark",
-            "language": "Danish",
-            "serp_date": end_time.isoformat(),
-            "items": items,
-            "item_count": len(items),
-            "started_at": start_time.isoformat(),
-            "completed_at": end_time.isoformat(),
-            "duration_seconds": duration,
-        }
-        try:
-            await webhook_service.send_webhook(
-                result_data=result,
-                origin_url=callback_url,
-                webhook_path="/api/webhook/serp-completed",
-            )
-            logger.info(f"Webhook sent for '{keyword}' ({len(items)} items)")
-        except Exception as e:
-            logger.error(f"Webhook failed for '{keyword}': {e}")
+    async def on_keyword_complete(
+        keyword: str, keyword_id: int, items: list, job: dict
+    ):
+        async with _webhook_semaphore:
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+
+            result = {
+                "status": "success",
+                "job_id": job["job_id"],
+                "keyword_id": keyword_id,
+                "keyword": keyword,
+                "country": "Denmark",
+                "language": "Danish",
+                "serp_date": end_time.isoformat(),
+                "items": items,
+                "item_count": len(items),
+                "started_at": start_time.isoformat(),
+                "completed_at": end_time.isoformat(),
+                "duration_seconds": duration,
+            }
+            try:
+                await webhook_service.send_webhook(
+                    result_data=result,
+                    origin_url=callback_url,
+                    webhook_path="/api/webhook/serp-completed",
+                )
+                logger.info(f"Webhook sent for '{keyword}' ({len(items)} items)")
+            except Exception as e:
+                logger.error(f"Webhook failed for '{keyword}': {e}")
 
     return on_keyword_complete
 
@@ -158,7 +167,7 @@ async def serp_postback(request: Request, background_tasks: BackgroundTasks):
 @router.get("/serp/jobs/{job_id}")
 async def get_job_status(job_id: str):
     """Poll job progress — useful for debugging or UI status indicators."""
-    status = serp_service.get_job_status(job_id)
+    status = await serp_service.get_job_status(job_id)
     if not status:
         raise HTTPException(status_code=404, detail="Job not found")
     return status
