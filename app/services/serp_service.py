@@ -6,7 +6,7 @@ import httpx
 import uuid
 import time
 import random
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -44,11 +44,16 @@ class SerpService:
         self,
         keywords: list[dict],  # [{"id": int, "keyword": str}, ...]
         depth: int = 100,
-        on_complete=None,  # async callback(job: dict) when all results arrive
+        on_keyword_complete: Optional[Callable] = None,  # async callback(keyword, keyword_id, items, job)
+        on_complete: Optional[Callable] = None,          # async callback(job) when ALL keywords done
     ) -> str:
         """
         Submit all keywords to DataForSEO with a postback URL.
         Returns job_id immediately — results arrive via handle_postback().
+
+        on_keyword_complete fires immediately for each keyword as its postback arrives.
+        on_complete fires once when all keywords are done (or watchdog triggers).
+        Results are NOT stored in memory — webhooks fire per-postback to keep RAM flat.
         """
         job_id = str(uuid.uuid4())
         tag = str(random.randint(1, 10_000_000))
@@ -59,11 +64,12 @@ class SerpService:
             "status": "processing",
             "created_at": time.time(),
             "last_postback_at": time.time(),
-            "keywords": keywords,  # full list with ids
+            "keywords": keywords,
             "keyword_map": {kw["keyword"]: kw["id"] for kw in keywords},
             "depth": depth,
-            "on_complete": on_complete,  # stored for later invocation
-            "results": {},  # keyword -> list[item]
+            "on_keyword_complete": on_keyword_complete,
+            "on_complete": on_complete,
+            # No "results" dict — we stream instead of accumulate
             "processed_count": 0,
         }
 
@@ -88,7 +94,8 @@ class SerpService:
     async def handle_postback(self, data: dict) -> bool:
         """
         Called by POST /serp/postback when DataForSEO delivers a result.
-        Matches via tag, stores results, fires on_complete when all done.
+        Fires on_keyword_complete immediately per keyword — does NOT accumulate results.
+        Fires on_complete once all keywords are processed.
         """
         try:
             tag = data["tasks"][0]["data"]["tag"]
@@ -104,9 +111,26 @@ class SerpService:
         job["last_postback_at"] = time.time()
 
         parsed = self._parse_postback(data)
+
         for keyword, items in parsed.items():
-            job["results"][keyword] = items
             job["processed_count"] += 1
+
+            keyword_id = job["keyword_map"].get(keyword)
+            if keyword_id is None:
+                logger.warning(
+                    f"Job {job['job_id']}: no keyword_id for '{keyword}' — skipping. "
+                    f"Sample keys: {list(job['keyword_map'].keys())[:3]}"
+                )
+                continue
+
+            # Fire webhook immediately — don't store items in RAM
+            if job.get("on_keyword_complete"):
+                try:
+                    await job["on_keyword_complete"](keyword, keyword_id, items, job)
+                except Exception as e:
+                    logger.error(
+                        f"Job {job['job_id']}: on_keyword_complete failed for '{keyword}': {e}"
+                    )
 
         logger.info(
             f"Job {job['job_id']}: {job['processed_count']}/{len(job['keywords'])} done"
@@ -157,7 +181,6 @@ class SerpService:
                 )
                 if response.status_code == 200:
                     result = response.json()
-                    # Log the top-level status
                     logger.info(
                         f"Job {job_id}: API status {result.get('status_code')} "
                         f"— {result.get('status_message')}"
@@ -190,7 +213,7 @@ class SerpService:
     async def _watchdog(self, job_id: str, timeout_seconds: int = 600):
         """
         If no postback arrives for timeout_seconds, complete the job with
-        whatever results have arrived so far — same pattern as jobQueue.py.
+        whatever has arrived so far.
         """
         while True:
             await asyncio.sleep(30)
@@ -219,19 +242,17 @@ class SerpService:
 
         job["status"] = "complete"
         logger.info(
-            f"Job {job_id} complete — {len(job['results'])}/{len(job['keywords'])} "
-            f"keywords returned results"
+            f"Job {job_id} complete — "
+            f"{job['processed_count']}/{len(job['keywords'])} keywords processed"
         )
 
-        # Invoke the caller-supplied callback (e.g. run_bulk_refresh webhook logic)
         if job.get("on_complete"):
             try:
                 await job["on_complete"](job)
             except Exception as e:
                 logger.error(f"Job {job_id} on_complete callback failed: {e}")
 
-        # Clean up after a short delay so callers can still read status
-        await asyncio.sleep(300)
+        # Clean up immediately — no results to hold onto anyway
         active_jobs.pop(job_id, None)
 
     # ------------------------------------------------------------------

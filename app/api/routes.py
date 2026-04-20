@@ -28,21 +28,15 @@ class SerpRequest(BaseModel):
 # ------------------------------------------------------------------
 
 
-async def _send_result_webhooks(
-    job: dict, callback_url: str | None, start_time: datetime
-):
-    """Fire one webhook per keyword once a bulk job completes."""
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-    keyword_map = job.get("keyword_map", {})
+def _make_keyword_complete_handler(callback_url: str | None, start_time: datetime):
+    """
+    Returns an async callback that fires a webhook immediately when a single
+    keyword's postback arrives. No results are held in memory.
+    """
+    async def on_keyword_complete(keyword: str, keyword_id: int, items: list, job: dict):
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
 
-    logger.info(
-        f"Job {job['job_id']} complete in {duration:.2f}s — "
-        f"sending webhooks for {len(job['results'])} keywords"
-    )
-
-    for keyword, items in job["results"].items():
-        keyword_id = keyword_map.get(keyword, 0)
         result = {
             "status": "success",
             "job_id": job["job_id"],
@@ -67,6 +61,8 @@ async def _send_result_webhooks(
         except Exception as e:
             logger.error(f"Webhook failed for '{keyword}': {e}")
 
+    return on_keyword_complete
+
 
 # ------------------------------------------------------------------
 # Routes
@@ -86,12 +82,9 @@ async def run_serp_search(
     start_time = datetime.now()
     callback_url = request.headers.get("X-Callback-URL")
 
-    async def on_complete(job: dict):
-        await _send_result_webhooks(job, callback_url, start_time)
-
     job_id = await serp_service.create_bulk_job(
         keywords=[{"id": body.keyword_id, "keyword": body.keyword}],
-        on_complete=on_complete,
+        on_keyword_complete=_make_keyword_complete_handler(callback_url, start_time),
     )
 
     logger.info(f"Single SERP job queued — job_id: {job_id}, keyword: '{body.keyword}'")
@@ -132,12 +125,9 @@ async def refresh_all_keywords(
     start_time = datetime.now()
     callback_url = settings.VERCEL_WEBHOOK_URL
 
-    async def on_complete(job: dict):
-        await _send_result_webhooks(job, callback_url, start_time)
-
     job_id = await serp_service.create_bulk_job(
         keywords=keywords,
-        on_complete=on_complete,
+        on_keyword_complete=_make_keyword_complete_handler(callback_url, start_time),
     )
 
     logger.info(f"Bulk refresh queued — job_id: {job_id}, {len(keywords)} keywords")
