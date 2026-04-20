@@ -33,10 +33,7 @@ class WebhookService:
         Returns:
             bool: True if webhook sent successfully, False otherwise
         """
-        if origin_url:
-            webhook_url = self._construct_webhook_url(origin_url, webhook_path)
-        else:
-            webhook_url = self.default_webhook_url
+        webhook_url = self._construct_webhook_url(origin_url, webhook_path)  # ← use this
 
         if not webhook_url:
             logger.error("No webhook URL available. Cannot send SERP webhook.")

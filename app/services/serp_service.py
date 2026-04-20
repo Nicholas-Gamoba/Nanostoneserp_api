@@ -129,11 +129,11 @@ class SerpService:
         keywords = [kw["keyword"] for kw in job["keywords"]]
         tag = job["tag"]
         depth = job["depth"]
-        batch_size = 100  # DataForSEO max per POST call
         client = get_http_client()
+        batch_size = 100
 
         for i in range(0, len(keywords), batch_size):
-            batch = keywords[i : i + batch_size]
+            batch = keywords[i:i + batch_size]
             payload = [
                 {
                     "keyword": kw,
@@ -156,20 +156,32 @@ class SerpService:
                     timeout=60.0,
                 )
                 if response.status_code == 200:
-                    n = len(response.json().get("tasks", []))
+                    result = response.json()
+                    # Log the top-level status
                     logger.info(
-                        f"Job {job_id}: submitted batch {i // batch_size + 1} "
-                        f"({n} tasks)"
+                        f"Job {job_id}: API status {result.get('status_code')} "
+                        f"— {result.get('status_message')}"
                     )
+                    for task in result.get("tasks", []):
+                        status = task.get("status_code")
+                        kw = task.get("data", {}).get("keyword", "?")
+                        msg = task.get("status_message", "")
+                        if status == 20100:
+                            logger.info(f"Job {job_id}: ✓ task created '{kw}'")
+                        else:
+                            logger.error(
+                                f"Job {job_id}: ✗ task REJECTED '{kw}' "
+                                f"— status={status} msg={msg}"
+                            )
                 else:
                     logger.error(
-                        f"Job {job_id}: batch submit failed — {response.status_code}"
+                        f"Job {job_id}: HTTP {response.status_code} — {response.text[:500]}"
                     )
             except Exception as e:
-                logger.error(f"Job {job_id}: batch submit error — {e}")
+                logger.error(f"Job {job_id}: submit exception — {e}")
 
             if i + batch_size < len(keywords):
-                await asyncio.sleep(1)  # brief pause between batches
+                await asyncio.sleep(1)
 
     # ------------------------------------------------------------------
     # PRIVATE — watchdog
