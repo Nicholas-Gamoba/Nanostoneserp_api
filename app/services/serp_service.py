@@ -8,6 +8,7 @@ import random
 import datetime
 from typing import Optional, Dict, Any, Callable
 from app.config import settings
+from app.services.regression_service import get_due_rechecks
 
 logger = logging.getLogger(__name__)
 
@@ -369,3 +370,21 @@ class SerpService:
         except Exception as e:
             logger.error(f"Error parsing postback: {e}")
         return results
+
+
+    async def schedule_recheck(self, delay_seconds: int = 10800, on_keyword_complete=None):
+        logger.info(f"Recheck scheduled in {delay_seconds}s")
+        await asyncio.sleep(delay_seconds)
+
+        due = await get_due_rechecks()
+        if not due:
+            logger.info("Recheck fired but nothing in queue — skipping")
+            return
+
+        keywords = [{"id": r["keyword_id"], "keyword": r["keyword"]} for r in due]
+        logger.info(f"Recheck launching — {len(keywords)} keywords")
+
+        await self.create_bulk_job(
+            keywords=keywords,
+            on_keyword_complete=on_keyword_complete,
+        )

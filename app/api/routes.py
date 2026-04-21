@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.services.webhook_service import WebhookService
 from app.services.serp_service import SerpService
 from app.config import settings
+from app.services.regression_service import queue_regressions
 import gzip
 import json
 
@@ -77,6 +78,26 @@ def _make_keyword_complete_handler(callback_url: str | None, start_time: datetim
 # Routes
 # ------------------------------------------------------------------
 
+
+@router.post("/serp/check-regressions")
+async def check_regressions(request: Request):
+    cron_secret = request.headers.get("X-Cron-Secret")
+    if cron_secret != settings.CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    result = await queue_regressions()
+
+    lost_count  = len(result.get("lost", []))
+    moved_count = len(result.get("moved_5", []))
+
+    if lost_count > 0 or moved_count > 0:
+        handler = _make_keyword_complete_handler(settings.VERCEL_WEBHOOK_URL, datetime.now())
+        asyncio.create_task(
+            serp_service.schedule_recheck(delay_seconds=10800, on_keyword_complete=handler)
+        )
+        logger.info("Recheck task created — will fire in 3h")
+
+    return result
 
 @router.post("/serp/search")
 async def run_serp_search(
