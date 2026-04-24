@@ -87,17 +87,22 @@ async def check_regressions(request: Request):
 
     result = await queue_regressions()
 
-    lost_count  = len(result.get("lost", []))
+    lost_count = len(result.get("lost", []))
     moved_count = len(result.get("moved_5", []))
 
     if lost_count > 0 or moved_count > 0:
-        handler = _make_keyword_complete_handler(settings.VERCEL_WEBHOOK_URL, datetime.now())
+        handler = _make_keyword_complete_handler(
+            settings.VERCEL_WEBHOOK_URL, datetime.now()
+        )
         asyncio.create_task(
-            serp_service.schedule_recheck(delay_seconds=10800, on_keyword_complete=handler)
+            serp_service.schedule_recheck(
+                delay_seconds=10800, on_keyword_complete=handler
+            )
         )
         logger.info("Recheck task created — will fire in 3h")
 
     return result
+
 
 @router.post("/serp/search")
 async def run_serp_search(
@@ -171,17 +176,15 @@ async def refresh_all_keywords(
 
 
 @router.post("/serp/postback")
-async def serp_postback(request: Request, background_tasks: BackgroundTasks):
+async def serp_postback(request: Request):
     body = await request.body()
-
     try:
         decompressed = gzip.decompress(body)
         data = json.loads(decompressed)
     except gzip.BadGzipFile:
-        # Fallback for uncompressed payloads
         data = json.loads(body)
 
-    background_tasks.add_task(serp_service.handle_postback, data)
+    await serp_service.handle_postback(data)
     return {"status": "ok"}
 
 

@@ -143,35 +143,38 @@ class SerpService:
             parsed = self._parse_postback(data)
 
             for keyword, items in parsed.items():
-                kw_row = await conn.fetchrow(
-                    """
-                    SELECT keyword_id FROM serp_job_keywords
-                    WHERE job_id = $1 AND keyword = $2
-                    """,
-                    job_id, keyword,
-                )
-                if not kw_row:
-                    logger.warning(
-                        f"Job {job_id}: no keyword_id for '{keyword}' — skipping"
+                async with conn.transaction():
+                    # Atomic: only succeeds if this keyword wasn't already marked done.
+                    # Handles duplicate postbacks safely.
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE serp_job_keywords
+                        SET done = true
+                        WHERE job_id = $1 AND keyword = $2 AND done = false
+                        RETURNING keyword_id
+                        """,
+                        job_id, keyword,
                     )
-                    continue
+                    if not updated:
+                        logger.debug(
+                            f"Job {job_id}: duplicate or unknown keyword '{keyword}' — skipping"
+                        )
+                        continue
 
-                keyword_id = kw_row["keyword_id"]
+                    keyword_id = updated["keyword_id"]
 
-                await conn.execute(
-                    "UPDATE serp_job_keywords SET done = true WHERE job_id = $1 AND keyword = $2",
-                    job_id, keyword,
-                )
-                await conn.execute(
-                    """
-                    UPDATE serp_jobs
-                    SET processed_count = processed_count + 1,
-                        last_postback_at = NOW()
-                    WHERE job_id = $1
-                    """,
-                    job_id,
-                )
+                    await conn.execute(
+                        """
+                        UPDATE serp_jobs
+                        SET processed_count = processed_count + 1,
+                            last_postback_at = NOW()
+                        WHERE job_id = $1
+                        """,
+                        job_id,
+                    )
 
+                # Callback runs OUTSIDE the transaction so a slow/failing callback
+                # doesn't hold a row lock on serp_jobs.
                 callbacks = _job_callbacks.get(job_id, {})
                 cb = callbacks.get("on_keyword_complete")
                 if cb:
@@ -234,6 +237,7 @@ class SerpService:
                         f"Job {job_id}: API status {result.get('status_code')} "
                         f"— {result.get('status_message')}"
                     )
+                    rejected_keywords = []
                     for task in result.get("tasks", []):
                         status = task.get("status_code")
                         kw = task.get("data", {}).get("keyword", "?")
@@ -245,6 +249,32 @@ class SerpService:
                                 f"Job {job_id}: ✗ task REJECTED '{kw}' "
                                 f"— status={status} msg={msg}"
                             )
+                            rejected_keywords.append(kw)
+
+                    if rejected_keywords:
+                        pool = await get_db_pool()
+                        async with pool.acquire() as conn:
+                            # Remove rejected keywords from the job so keywords_total reflects
+                            # what will actually come back via postback.
+                            await conn.execute(
+                                """
+                                DELETE FROM serp_job_keywords
+                                WHERE job_id = $1 AND keyword = ANY($2::text[])
+                                """,
+                                job_id, rejected_keywords,
+                            )
+                            await conn.execute(
+                                """
+                                UPDATE serp_jobs
+                                SET keywords_total = keywords_total - $2
+                                WHERE job_id = $1
+                                """,
+                                job_id, len(rejected_keywords),
+                            )
+                        logger.warning(
+                            f"Job {job_id}: removed {len(rejected_keywords)} rejected keywords "
+                            f"from total"
+                        )
                 else:
                     logger.error(
                         f"Job {job_id}: HTTP {response.status_code} — {response.text[:500]}"
@@ -333,7 +363,7 @@ class SerpService:
 # Module-level shared watchdog — one loop for ALL active jobs
 # ------------------------------------------------------------------
 
-async def _global_watchdog(poll_interval: int = 30, timeout_seconds: int = 600):
+async def _global_watchdog(poll_interval: int = 30, timeout_seconds: int = 1800):
     """
     Single coroutine that scans all processing jobs every `poll_interval`
     seconds and times out any that have gone silent.
