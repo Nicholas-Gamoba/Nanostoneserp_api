@@ -35,41 +35,47 @@ class SerpRequest(BaseModel):
 
 def _make_keyword_complete_handler(callback_url: str | None, start_time: datetime):
     """
-    Returns an async callback that fires a webhook immediately when a single
-    keyword's postback arrives. No results are held in memory.
+    Returns an async callback that fires a webhook when a single keyword's
+    postback arrives. Webhook send is detached via asyncio.create_task so
+    it does NOT block the postback response to DataForSEO.
     Throttled to 10 concurrent webhooks via semaphore.
     """
 
     async def on_keyword_complete(
         keyword: str, keyword_id: int, items: list, job: dict
     ):
-        async with _webhook_semaphore:
-            end_time = datetime.now()
-            duration = (end_time - start_time).total_seconds()
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
 
-            result = {
-                "status": "success",
-                "job_id": job["job_id"],
-                "keyword_id": keyword_id,
-                "keyword": keyword,
-                "country": "Denmark",
-                "language": "Danish",
-                "serp_date": end_time.isoformat(),
-                "items": items,
-                "item_count": len(items),
-                "started_at": start_time.isoformat(),
-                "completed_at": end_time.isoformat(),
-                "duration_seconds": duration,
-            }
-            try:
-                await webhook_service.send_webhook(
-                    result_data=result,
-                    origin_url=callback_url,
-                    webhook_path="/api/webhook/serp-completed",
-                )
-                logger.info(f"Webhook sent for '{keyword}' ({len(items)} items)")
-            except Exception as e:
-                logger.error(f"Webhook failed for '{keyword}': {e}")
+        result = {
+            "status": "success",
+            "job_id": job["job_id"],
+            "keyword_id": keyword_id,
+            "keyword": keyword,
+            "country": "Denmark",
+            "language": "Danish",
+            "serp_date": end_time.isoformat(),
+            "items": items,
+            "item_count": len(items),
+            "started_at": start_time.isoformat(),
+            "completed_at": end_time.isoformat(),
+            "duration_seconds": duration,
+        }
+
+        async def _send():
+            async with _webhook_semaphore:
+                try:
+                    await webhook_service.send_webhook(
+                        result_data=result,
+                        origin_url=callback_url,
+                        webhook_path="/api/webhook/serp-completed",
+                    )
+                    logger.info(f"Webhook sent for '{keyword}' ({len(items)} items)")
+                except Exception as e:
+                    logger.error(f"Webhook failed for '{keyword}': {e}")
+
+        # Fire and forget — don't block the postback response on Vercel's latency.
+        asyncio.create_task(_send())
 
     return on_keyword_complete
 
