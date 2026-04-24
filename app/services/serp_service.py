@@ -26,8 +26,10 @@ async def get_db_pool():
         import asyncpg
         _db_pool = await asyncpg.create_pool(
             settings.DATABASE_URL,
-            min_size=2,
-            max_size=10,  # tune to your Postgres plan
+            min_size=5,
+            max_size=25,
+            command_timeout=30.0,
+            timeout=10.0,  # connection-acquire timeout
         )
     return _db_pool
 
@@ -84,7 +86,10 @@ class SerpService:
                      last_postback_at)
                 VALUES ($1, $2, 'processing', $3, $4, 0, NOW())
                 """,
-                job_id, tag, depth, len(keywords),
+                job_id,
+                tag,
+                depth,
+                len(keywords),
             )
             await conn.executemany(
                 """
@@ -128,11 +133,16 @@ class SerpService:
             logger.error("Postback missing tag — ignoring")
             return False
 
+        parsed = self._parse_postback(data)
         pool = await get_db_pool()
+
+        # Phase 1: Quickly look up the job and update all keywords.
+        # Release the connection before running callbacks.
+        processed_keywords = []  # (keyword, keyword_id, items)
+        job_id = None
+
         async with pool.acquire() as conn:
-            job_row = await conn.fetchrow(
-                "SELECT * FROM serp_jobs WHERE tag = $1", tag
-            )
+            job_row = await conn.fetchrow("SELECT * FROM serp_jobs WHERE tag = $1", tag)
             if not job_row:
                 logger.warning(f"No job found for postback tag={tag}")
                 return False
@@ -140,12 +150,9 @@ class SerpService:
                 return True
 
             job_id = job_row["job_id"]
-            parsed = self._parse_postback(data)
 
             for keyword, items in parsed.items():
                 async with conn.transaction():
-                    # Atomic: only succeeds if this keyword wasn't already marked done.
-                    # Handles duplicate postbacks safely.
                     updated = await conn.fetchrow(
                         """
                         UPDATE serp_job_keywords
@@ -153,7 +160,8 @@ class SerpService:
                         WHERE job_id = $1 AND keyword = $2 AND done = false
                         RETURNING keyword_id
                         """,
-                        job_id, keyword,
+                        job_id,
+                        keyword,
                     )
                     if not updated:
                         logger.debug(
@@ -173,28 +181,30 @@ class SerpService:
                         job_id,
                     )
 
-                # Callback runs OUTSIDE the transaction so a slow/failing callback
-                # doesn't hold a row lock on serp_jobs.
-                callbacks = _job_callbacks.get(job_id, {})
-                cb = callbacks.get("on_keyword_complete")
-                if cb:
-                    try:
-                        await cb(keyword, keyword_id, items, {"job_id": job_id, "tag": tag})
-                    except Exception as e:
-                        logger.error(
-                            f"Job {job_id}: on_keyword_complete failed for '{keyword}': {e}"
-                        )
+                    processed_keywords.append((keyword, keyword_id, items))
 
             updated = await conn.fetchrow(
                 "SELECT processed_count, keywords_total FROM serp_jobs WHERE job_id = $1",
                 job_id,
             )
+            processed_count = updated["processed_count"]
+            keywords_total = updated["keywords_total"]
 
-        logger.info(
-            f"Job {job_id}: {updated['processed_count']}/{updated['keywords_total']} done"
-        )
+        # Connection released here — now fire callbacks without holding a DB slot.
+        callbacks = _job_callbacks.get(job_id, {})
+        cb = callbacks.get("on_keyword_complete")
+        if cb:
+            for keyword, keyword_id, items in processed_keywords:
+                try:
+                    await cb(keyword, keyword_id, items, {"job_id": job_id, "tag": tag})
+                except Exception as e:
+                    logger.error(
+                        f"Job {job_id}: on_keyword_complete failed for '{keyword}': {e}"
+                    )
 
-        if updated["processed_count"] >= updated["keywords_total"]:
+        logger.info(f"Job {job_id}: {processed_count}/{keywords_total} done")
+
+        if processed_count >= keywords_total:
             await self._complete_job(job_id)
 
         return True
@@ -203,13 +213,15 @@ class SerpService:
     # PRIVATE — submission
     # ------------------------------------------------------------------
 
-    async def _submit_all(self, job_id: str, keywords: list[dict], tag: str, depth: int):
+    async def _submit_all(
+        self, job_id: str, keywords: list[dict], tag: str, depth: int
+    ):
         client = get_http_client()
         batch_size = 100
         kw_strings = [kw["keyword"] for kw in keywords]
 
         for i in range(0, len(kw_strings), batch_size):
-            batch = kw_strings[i: i + batch_size]
+            batch = kw_strings[i : i + batch_size]
             payload = [
                 {
                     "keyword": kw,
@@ -261,7 +273,8 @@ class SerpService:
                                 DELETE FROM serp_job_keywords
                                 WHERE job_id = $1 AND keyword = ANY($2::text[])
                                 """,
-                                job_id, rejected_keywords,
+                                job_id,
+                                rejected_keywords,
                             )
                             await conn.execute(
                                 """
@@ -269,7 +282,8 @@ class SerpService:
                                 SET keywords_total = keywords_total - $2
                                 WHERE job_id = $1
                                 """,
-                                job_id, len(rejected_keywords),
+                                job_id,
+                                len(rejected_keywords),
                             )
                         logger.warning(
                             f"Job {job_id}: removed {len(rejected_keywords)} rejected keywords "
@@ -341,7 +355,9 @@ class SerpService:
             logger.error(f"Error parsing postback: {e}")
         return results
 
-    async def schedule_recheck(self, delay_seconds: int = 10800, on_keyword_complete=None):
+    async def schedule_recheck(
+        self, delay_seconds: int = 10800, on_keyword_complete=None
+    ):
         logger.info(f"Recheck scheduled in {delay_seconds}s")
         await asyncio.sleep(delay_seconds)
 
@@ -362,6 +378,7 @@ class SerpService:
 # ------------------------------------------------------------------
 # Module-level shared watchdog — one loop for ALL active jobs
 # ------------------------------------------------------------------
+
 
 async def _global_watchdog(poll_interval: int = 30, timeout_seconds: int = 1800):
     """
