@@ -1,4 +1,3 @@
-# app/api/routes.py
 import logging
 import asyncio
 from datetime import datetime
@@ -17,8 +16,37 @@ router = APIRouter()
 webhook_service = WebhookService()
 serp_service = SerpService()
 
-# Limit concurrent outbound webhooks to avoid exhausting Vercel's Prisma connection pool
-_webhook_semaphore = asyncio.Semaphore(10)
+# Bounded queue prevents unbounded memory growth.
+# If queue fills, postback handler will await — backpressure on DataForSEO.
+_webhook_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+_webhook_workers_started = False
+NUM_WEBHOOK_WORKERS = 10
+
+
+async def _webhook_worker():
+    """Worker pulls from the queue and sends webhooks one at a time."""
+    while True:
+        result, callback_url, keyword, item_count = await _webhook_queue.get()
+        try:
+            await webhook_service.send_webhook(
+                result_data=result,
+                origin_url=callback_url,
+                webhook_path="/api/webhook/serp-completed",
+            )
+            logger.info(f"Webhook sent for '{keyword}' ({item_count} items)")
+        except Exception as e:
+            logger.error(f"Webhook failed for '{keyword}': {e}")
+        finally:
+            _webhook_queue.task_done()
+
+
+def _ensure_workers_started():
+    global _webhook_workers_started
+    if not _webhook_workers_started:
+        for _ in range(NUM_WEBHOOK_WORKERS):
+            asyncio.create_task(_webhook_worker())
+        _webhook_workers_started = True
+        logger.info(f"Started {NUM_WEBHOOK_WORKERS} webhook workers")
 
 
 class SerpRequest(BaseModel):
@@ -28,22 +56,17 @@ class SerpRequest(BaseModel):
     language: str
 
 
-# ------------------------------------------------------------------
-# Webhook helpers
-# ------------------------------------------------------------------
-
-
 def _make_keyword_complete_handler(callback_url: str | None, start_time: datetime):
     """
-    Returns an async callback that fires a webhook when a single keyword's
-    postback arrives. Webhook send is detached via asyncio.create_task so
-    it does NOT block the postback response to DataForSEO.
-    Throttled to 10 concurrent webhooks via semaphore.
+    Returns a callback that enqueues a webhook for processing by the worker pool.
+    The queue is bounded — if it fills, this awaits, applying backpressure.
     """
 
     async def on_keyword_complete(
         keyword: str, keyword_id: int, items: list, job: dict
     ):
+        _ensure_workers_started()
+
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
@@ -62,20 +85,16 @@ def _make_keyword_complete_handler(callback_url: str | None, start_time: datetim
             "duration_seconds": duration,
         }
 
-        async def _send():
-            async with _webhook_semaphore:
-                try:
-                    await webhook_service.send_webhook(
-                        result_data=result,
-                        origin_url=callback_url,
-                        webhook_path="/api/webhook/serp-completed",
-                    )
-                    logger.info(f"Webhook sent for '{keyword}' ({len(items)} items)")
-                except Exception as e:
-                    logger.error(f"Webhook failed for '{keyword}': {e}")
-
-        # Fire and forget — don't block the postback response on Vercel's latency.
-        asyncio.create_task(_send())
+        # Use put_nowait + drop logic to avoid blocking the postback if queue is full.
+        # If you'd rather apply backpressure (slower postback responses but no drops),
+        # use `await _webhook_queue.put(...)` instead.
+        try:
+            _webhook_queue.put_nowait((result, callback_url, keyword, len(items)))
+        except asyncio.QueueFull:
+            logger.warning(
+                f"Webhook queue full — dropping webhook for '{keyword}'. "
+                f"Data is safe in DB; Vercel will be out of sync for this keyword."
+            )
 
     return on_keyword_complete
 
@@ -150,16 +169,14 @@ async def refresh_all_keywords(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        import asyncpg
-
-        conn = await asyncpg.connect(settings.DATABASE_URL)
-        rows = await conn.fetch('SELECT id, keyword FROM "SEOKeyword" ORDER BY id')
-        await conn.close()
+        from app.services.serp_service import get_db_pool
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch('SELECT id, keyword FROM "SEOKeyword" ORDER BY id')
         keywords = [{"id": row["id"], "keyword": row["keyword"]} for row in rows]
     except Exception as e:
         logger.error(f"Failed to fetch keywords from DB: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch keywords: {e}")
-
     if not keywords:
         return {"status": "no_keywords", "message": "No keywords found"}
 

@@ -136,10 +136,9 @@ class SerpService:
         parsed = self._parse_postback(data)
         pool = await get_db_pool()
 
-        # Phase 1: Quickly look up the job and update all keywords.
-        # Release the connection before running callbacks.
-        processed_keywords = []  # (keyword, keyword_id, items)
         job_id = None
+        processed_count = 0
+        keywords_total = 0
 
         async with pool.acquire() as conn:
             job_row = await conn.fetchrow("SELECT * FROM serp_jobs WHERE tag = $1", tag)
@@ -150,6 +149,8 @@ class SerpService:
                 return True
 
             job_id = job_row["job_id"]
+            callbacks = _job_callbacks.get(job_id, {})
+            cb = callbacks.get("on_keyword_complete")
 
             for keyword, items in parsed.items():
                 async with conn.transaction():
@@ -181,7 +182,17 @@ class SerpService:
                         job_id,
                     )
 
-                    processed_keywords.append((keyword, keyword_id, items))
+                # items goes out of scope after callback — GC'd immediately
+                if cb:
+                    try:
+                        await cb(keyword, keyword_id, items, {"job_id": job_id, "tag": tag})
+                    except Exception as e:
+                        logger.error(
+                            f"Job {job_id}: on_keyword_complete failed for '{keyword}': {e}"
+                        )
+
+                # Explicitly release reference so GC doesn't wait for loop end
+                items = None
 
             updated = await conn.fetchrow(
                 "SELECT processed_count, keywords_total FROM serp_jobs WHERE job_id = $1",
@@ -189,18 +200,6 @@ class SerpService:
             )
             processed_count = updated["processed_count"]
             keywords_total = updated["keywords_total"]
-
-        # Connection released here — now fire callbacks without holding a DB slot.
-        callbacks = _job_callbacks.get(job_id, {})
-        cb = callbacks.get("on_keyword_complete")
-        if cb:
-            for keyword, keyword_id, items in processed_keywords:
-                try:
-                    await cb(keyword, keyword_id, items, {"job_id": job_id, "tag": tag})
-                except Exception as e:
-                    logger.error(
-                        f"Job {job_id}: on_keyword_complete failed for '{keyword}': {e}"
-                    )
 
         logger.info(f"Job {job_id}: {processed_count}/{keywords_total} done")
 
@@ -213,18 +212,15 @@ class SerpService:
     # PRIVATE — submission
     # ------------------------------------------------------------------
 
-    async def _submit_all(
-        self, job_id: str, keywords: list[dict], tag: str, depth: int
-    ):
+    async def _submit_all(self, job_id, keywords, tag, depth):
         client = get_http_client()
         batch_size = 100
-        kw_strings = [kw["keyword"] for kw in keywords]
 
-        for i in range(0, len(kw_strings), batch_size):
-            batch = kw_strings[i : i + batch_size]
+        for i in range(0, len(keywords), batch_size):
+            batch = keywords[i : i + batch_size]  # slice dicts, not a pre-built list
             payload = [
                 {
-                    "keyword": kw,
+                    "keyword": kw["keyword"],
                     "location_code": 2208,
                     "language_code": "da",
                     "depth": depth,
@@ -296,7 +292,7 @@ class SerpService:
             except Exception as e:
                 logger.error(f"Job {job_id}: submit exception — {e}")
 
-            if i + batch_size < len(kw_strings):
+            if i + batch_size < len(keywords):
                 await asyncio.sleep(1)
 
     # ------------------------------------------------------------------
