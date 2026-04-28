@@ -24,6 +24,7 @@ async def get_db_pool():
     global _db_pool
     if _db_pool is None:
         import asyncpg
+
         _db_pool = await asyncpg.create_pool(
             settings.DATABASE_URL,
             min_size=5,
@@ -185,7 +186,9 @@ class SerpService:
                 # items goes out of scope after callback — GC'd immediately
                 if cb:
                     try:
-                        await cb(keyword, keyword_id, items, {"job_id": job_id, "tag": tag})
+                        await cb(
+                            keyword, keyword_id, items, {"job_id": job_id, "tag": tag}
+                        )
                     except Exception as e:
                         logger.error(
                             f"Job {job_id}: on_keyword_complete failed for '{keyword}': {e}"
@@ -204,7 +207,21 @@ class SerpService:
         logger.info(f"Job {job_id}: {processed_count}/{keywords_total} done")
 
         if processed_count >= keywords_total:
-            await self._complete_job(job_id)
+            # Don't complete until submission is fully done — otherwise we race
+            # with _submit_all decrementing keywords_total for rejections.
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                sub_done = await conn.fetchval(
+                    "SELECT submission_complete FROM serp_jobs WHERE job_id = $1",
+                    job_id,
+                )
+            if sub_done:
+                await self._complete_job(job_id)
+            else:
+                logger.info(
+                    f"Job {job_id}: count met but submission still in progress — "
+                    f"deferring completion"
+                )
 
         return True
 
@@ -294,6 +311,27 @@ class SerpService:
 
             if i + batch_size < len(keywords):
                 await asyncio.sleep(1)
+
+        # All batches submitted — now postbacks can complete the job.
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE serp_jobs SET submission_complete = true WHERE job_id = $1",
+                job_id,
+            )
+        logger.info(f"Job {job_id}: submission complete, {len(keywords)} keywords sent")
+
+        # If postbacks already drained while we were still submitting,
+        # the last postback's completion check would have been skipped.
+        # Re-check now.
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT processed_count, keywords_total FROM serp_jobs "
+                "WHERE job_id = $1 AND status = 'processing'",
+                job_id,
+            )
+        if row and row["processed_count"] >= row["keywords_total"]:
+            await self._complete_job(job_id)
 
     # ------------------------------------------------------------------
     # PRIVATE — single shared watchdog (replaces per-job watchdog)
@@ -390,7 +428,8 @@ async def _global_watchdog(poll_interval: int = 30, timeout_seconds: int = 1800)
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT job_id, last_postback_at, processed_count, keywords_total
+                    SELECT job_id, last_postback_at, processed_count, keywords_total,
+                           submission_complete
                     FROM serp_jobs
                     WHERE status = 'processing'
                     """
@@ -403,6 +442,8 @@ async def _global_watchdog(poll_interval: int = 30, timeout_seconds: int = 1800)
 
             now = datetime.datetime.now(datetime.timezone.utc)
             for row in rows:
+                if not row["submission_complete"]:
+                    continue  # don't time out a job mid-submission
                 last = row["last_postback_at"]
                 if last is None:
                     continue  # job just created, give it time
