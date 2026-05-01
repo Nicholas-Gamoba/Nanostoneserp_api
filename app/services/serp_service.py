@@ -172,6 +172,7 @@ class SerpService:
                         continue
 
                     keyword_id = updated["keyword_id"]
+                    serp_date = datetime.datetime.now(datetime.timezone.utc)
 
                     await conn.execute(
                         """
@@ -183,18 +184,58 @@ class SerpService:
                         job_id,
                     )
 
-                # items goes out of scope after callback — GC'd immediately
+                    rows_to_insert = [
+                        (
+                            keyword_id,
+                            item["type"],
+                            item["rank_group"],
+                            item["rank_absolute"],
+                            item["item_position"],
+                            item["domain"],
+                            item["url"],
+                            item["title"],
+                            item["description"],
+                            serp_date,
+                        )
+                        for item in items
+                        if item.get("type") and item.get("rank_absolute") is not None
+                    ]
+                    if rows_to_insert:
+                        await conn.executemany(
+                            """
+                            INSERT INTO serp_results
+                                (keyword_id, country, language, type, rank_group, rank_absolute,
+                                item_position, domain, url, title, description, serp_date)
+                            VALUES ($1, 'Denmark', 'Danish', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                            ON CONFLICT (keyword_id, country, language, type, rank_absolute, serp_date)
+                            DO UPDATE SET
+                                rank_group    = EXCLUDED.rank_group,
+                                item_position = EXCLUDED.item_position,
+                                domain        = EXCLUDED.domain,
+                                url           = EXCLUDED.url,
+                                title         = EXCLUDED.title,
+                                description   = EXCLUDED.description,
+                                updated_at    = NOW()
+                            """,
+                            rows_to_insert,
+                        )
+                        logger.debug(
+                            f"Job {job_id}: saved {len(rows_to_insert)} rows for '{keyword}'"
+                        )
+
                 if cb:
                     try:
                         await cb(
-                            keyword, keyword_id, items, {"job_id": job_id, "tag": tag}
+                            keyword,
+                            keyword_id,
+                            items,
+                            {"job_id": job_id, "tag": tag, "serp_date": serp_date.isoformat()},
                         )
                     except Exception as e:
                         logger.error(
                             f"Job {job_id}: on_keyword_complete failed for '{keyword}': {e}"
                         )
 
-                # Explicitly release reference so GC doesn't wait for loop end
                 items = None
 
             updated = await conn.fetchrow(
@@ -207,8 +248,6 @@ class SerpService:
         logger.info(f"Job {job_id}: {processed_count}/{keywords_total} done")
 
         if processed_count >= keywords_total:
-            # Don't complete until submission is fully done — otherwise we race
-            # with _submit_all decrementing keywords_total for rejections.
             pool = await get_db_pool()
             async with pool.acquire() as conn:
                 sub_done = await conn.fetchval(

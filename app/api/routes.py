@@ -58,8 +58,9 @@ class SerpRequest(BaseModel):
 
 def _make_keyword_complete_handler(callback_url: str | None, start_time: datetime):
     """
-    Returns a callback that enqueues a webhook for processing by the worker pool.
-    The queue is bounded — if it fills, this awaits, applying backpressure.
+    Returns a callback that enqueues a best-effort webhook notification.
+    Results are already written to serp_results before this fires — a dropped
+    webhook no longer means lost data.
     """
 
     async def on_keyword_complete(
@@ -77,7 +78,7 @@ def _make_keyword_complete_handler(callback_url: str | None, start_time: datetim
             "keyword": keyword,
             "country": "Denmark",
             "language": "Danish",
-            "serp_date": end_time.isoformat(),
+            "serp_date": job["serp_date"],
             "items": items,
             "item_count": len(items),
             "started_at": start_time.isoformat(),
@@ -85,15 +86,12 @@ def _make_keyword_complete_handler(callback_url: str | None, start_time: datetim
             "duration_seconds": duration,
         }
 
-        # Use put_nowait + drop logic to avoid blocking the postback if queue is full.
-        # If you'd rather apply backpressure (slower postback responses but no drops),
-        # use `await _webhook_queue.put(...)` instead.
         try:
             _webhook_queue.put_nowait((result, callback_url, keyword, len(items)))
         except asyncio.QueueFull:
             logger.warning(
-                f"Webhook queue full — dropping webhook for '{keyword}'. "
-                f"Data is safe in DB; Vercel will be out of sync for this keyword."
+                f"Webhook queue full — dropping notification for '{keyword}'. "
+                f"Results already saved to DB."
             )
 
     return on_keyword_complete
