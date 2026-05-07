@@ -277,7 +277,7 @@ class SerpService:
             payload = [
                 {
                     "keyword": kw["keyword"],
-                    "location_code": 2208,
+                    "location_code": 1005010,
                     "language_code": "da",
                     "depth": depth,
                     "tag": tag,
