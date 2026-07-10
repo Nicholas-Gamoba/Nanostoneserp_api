@@ -167,14 +167,20 @@ async def refresh_all_keywords(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        from app.services.serp_service import get_db_pool
+        from app.services.serp_service import get_db_pool, ensure_db_ready
+        # This is the first DB hit after an idle night. Wake a suspended Neon
+        # compute (and rebuild a stale pool) with retries before querying, so a
+        # cold start no longer 500s the entire refresh.
+        await ensure_db_ready()
         pool = await get_db_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch('SELECT id, keyword FROM "SEOKeyword" ORDER BY id')
         keywords = [{"id": row["id"], "keyword": row["keyword"]} for row in rows]
     except Exception as e:
-        logger.error(f"Failed to fetch keywords from DB: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch keywords: {e}")
+        # repr(e) — a bare {e} prints nothing for TimeoutError, which is exactly
+        # what hid the root cause in the logs for weeks.
+        logger.error(f"Failed to fetch keywords from DB: {type(e).__name__}: {e!r}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch keywords: {e!r}")
     if not keywords:
         return {"status": "no_keywords", "message": "No keywords found"}
 

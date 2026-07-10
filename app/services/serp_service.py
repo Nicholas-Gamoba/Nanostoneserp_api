@@ -19,20 +19,79 @@ _http_client: Optional[httpx.AsyncClient] = None
 # --- Connection pool (replaces per-call asyncpg.connect) ---
 _db_pool = None
 
+# Neon scales its compute to zero after a few minutes idle. Waking it
+# ("cold start") can take 15-30s+, during which connections time out or are
+# refused. These budgets must comfortably exceed that wake time — the old
+# 10s acquire timeout was shorter than the cold start, so the 00:00 cron
+# (first DB hit after an idle night) 500'd on every run and the every-3-day
+# full refresh silently stopped producing data.
+DB_CONNECT_TIMEOUT = 60.0   # per-connection establishment budget
+DB_POOL_INIT_RETRIES = 5
+
 
 async def get_db_pool():
     global _db_pool
     if _db_pool is None:
         import asyncpg
 
-        _db_pool = await asyncpg.create_pool(
-            settings.DATABASE_URL,
-            min_size=5,
-            max_size=25,
-            command_timeout=30.0,
-            timeout=10.0,  # connection-acquire timeout
-        )
+        last_err = None
+        for attempt in range(1, DB_POOL_INIT_RETRIES + 1):
+            try:
+                _db_pool = await asyncpg.create_pool(
+                    settings.DATABASE_URL,
+                    min_size=2,  # fewer upfront connections -> faster cold-start init
+                    max_size=25,
+                    command_timeout=30.0,
+                    timeout=DB_CONNECT_TIMEOUT,  # connection-establishment timeout
+                )
+                return _db_pool
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    f"DB pool init attempt {attempt}/{DB_POOL_INIT_RETRIES} failed: "
+                    f"{type(e).__name__}: {e!r} — retrying"
+                )
+                await asyncio.sleep(min(3 * attempt, 15))
+        raise RuntimeError(f"Could not initialize DB pool: {last_err!r}")
     return _db_pool
+
+
+async def ensure_db_ready(max_attempts: int = 5) -> None:
+    """
+    Guarantee the database is actually reachable *right now*, waking a
+    suspended Neon compute and rebuilding a stale pool if needed.
+
+    Call this at the start of cron-triggered entry points (the first DB hit
+    after a long idle period) before running the real query. Both failure
+    modes are covered:
+      * cold Neon  -> connection establishment is retried with backoff
+      * stale pool -> a failing `SELECT 1` drops the dead pool so it rebuilds
+    """
+    global _db_pool
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            if attempt > 1:
+                logger.info(f"DB ready after {attempt} attempts")
+            return
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"DB not ready (attempt {attempt}/{max_attempts}): "
+                f"{type(e).__name__}: {e!r}"
+            )
+            # Drop a possibly-dead pool so the next attempt rebuilds it.
+            if _db_pool is not None:
+                try:
+                    await _db_pool.close()
+                except Exception:
+                    pass
+                _db_pool = None
+            await asyncio.sleep(min(3 * attempt, 15))
+    raise RuntimeError(f"DB not reachable after {max_attempts} attempts: {last_err!r}")
 
 
 def get_http_client() -> httpx.AsyncClient:
